@@ -643,6 +643,7 @@ namespace Mist{
     std::string line;
     std::string curDateString;
     std::string curDurationString;
+    std::string curCueString;
     // Quits early if we have no more segments we need to remove
     bool done = false;
     bool hasSegment = false;
@@ -669,6 +670,11 @@ namespace Mist{
         curDateString = line;
         continue;
       }
+      if (strncmp(line.c_str(), "#EXT-X-CUE-OUT", 14) == 0 ||
+          strncmp(line.c_str(), "#EXT-X-CUE-IN", 13) == 0){
+        curCueString += line + "\n";
+        continue;
+      }
       // Pass along any other lines starting with a # character as is
       if (line[0] == '#'){
         newBuffer += line + "\n";
@@ -680,6 +686,7 @@ namespace Mist{
         HIGH_MSG("Dropping segment #%" PRIu64 " from the playlist due to the playlist reaching it's max size of %" PRIu64 " segments", segmentsRemoved, maxEntries);
         curDateString = "";
         curDurationString = "";
+        curCueString = "";
         segmentsRemoved++;
         if (!targetParams.count("nounlink")) {
           std::string segPath = playlistLocation.link(line).getFilePath();
@@ -698,6 +705,7 @@ namespace Mist{
           // If the segment is too old, ignore and reset fields
           curDurationString = "";
           curDateString = "";
+          curCueString = "";
           segmentsRemoved++;
           if (!targetParams.count("nounlink")) {
             std::string segPath = playlistLocation.link(line).getFilePath();
@@ -715,6 +723,10 @@ namespace Mist{
       if (curDateString.size()){
         newBuffer += curDateString + "\n";
         curDateString = "";
+      }
+      if (curCueString.size()){
+        newBuffer += curCueString;
+        curCueString = "";
       }
       if (curDurationString.size()){
         newBuffer += curDurationString + "\n";
@@ -2053,6 +2065,31 @@ namespace Mist{
                   playlistBuffer += "#EXT-X-PROGRAM-DATE-TIME:" + Util::getUTCStringMillis(unixMs) + "\n";
                 }
               }
+              // SCTE-35 Ad Marker Injection
+              if (spliceInPending && inSpliceOut && currentStartTime >= spliceEndTimeMs){
+                playlistBuffer += "#EXT-X-CUE-IN\n";
+                spliceInPending = false;
+                inSpliceOut = false;
+              }
+              if (spliceOutPending){
+                std::stringstream cueTag;
+                cueTag << "#EXT-X-CUE-OUT:DURATION=" << std::fixed
+                       << std::setprecision(1) << spliceOutDuration << "\n";
+                playlistBuffer += cueTag.str();
+                spliceOutPending = false;
+                spliceInPending = true;  // invariant: every CUE-OUT guarantees a CUE-IN
+                inSpliceOut = true;
+                spliceStartTimeMs = currentStartTime;
+                spliceEndTimeMs = currentStartTime + (uint64_t)(spliceOutDuration * 1000.0);
+              }else if (inSpliceOut){
+                double elapsed = currentStartTime >= spliceStartTimeMs
+                    ? (currentStartTime - spliceStartTimeMs) / 1000.0 : 0.0;
+                std::stringstream contTag;
+                contTag << "#EXT-X-CUE-OUT-CONT:ElapsedTime=" << std::fixed
+                        << std::setprecision(1) << elapsed
+                        << ",Duration=" << spliceOutDuration << "\n";
+                playlistBuffer += contTag.str();
+              }
               INFO_MSG("Adding new segment `%s` of %" PRIu64 "ms to playlist '%s'", segment.c_str(), lastPacketTime - currentStartTime, playlistLocationString.c_str());
               // Append duration & TS filename to playlist file
               std::stringstream tmp;
@@ -2164,6 +2201,16 @@ namespace Mist{
           {
             uint64_t unixMs = M.packetTimeToUnixMs(currentStartTime, systemBoot);
             if (unixMs){playlistBuffer += "#EXT-X-PROGRAM-DATE-TIME:" + Util::getUTCStringMillis(unixMs) + "\n";}
+          }
+          // SCTE-35: Close any active ad break on final segment
+          if (spliceOutPending){
+            WARN_MSG("SCTE35 splice_out pending at shutdown - dropped (no future segment for CUE-IN)");
+            spliceOutPending = false;
+          }
+          if (inSpliceOut){
+            playlistBuffer += "#EXT-X-CUE-IN\n";
+            spliceInPending = false;
+            inSpliceOut = false;
           }
           // Append duration & TS filename to playlist file
           std::stringstream tmp;

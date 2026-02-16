@@ -175,6 +175,14 @@ namespace Mist{
     
     bool liveSeekDisabled;
 
+    // SCTE-35 HLS manifest ad marker state
+    bool spliceOutPending = false;
+    bool spliceInPending = false;
+    bool inSpliceOut = false;
+    double spliceOutDuration = 0.0;
+    uint64_t spliceStartTimeMs = 0;
+    uint64_t spliceEndTimeMs = 0;
+
     Event::Loop evLp;
 
   };

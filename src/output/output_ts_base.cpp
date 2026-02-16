@@ -234,14 +234,33 @@ namespace Mist{
     }else if (type == "meta"){
       if (codec == "SCTE35") {
         if (dataLen && dataPointer[0] == '{') {
-          uint64_t duration = 30000;
           JSON::Value cmd = JSON::fromString(dataPointer, dataLen);
-          if (cmd.isMember("splice_out")) { duration = cmd["splice_out"].asInt(); }
-          TS::SpliceInfoSection sis;
-          sis.randomizeSpliceID();
-          sis.writeSpliceDuration(duration);
-          sis.writeCRC();
-          fillPacket(sis.checkAndGetBuffer() + 4, 36, firstPack, false, true, pkgPid, contPkg);
+          if (cmd.isMember("splice_out")){
+            int64_t raw = cmd["splice_out"].asInt();
+            if (raw < 1000){
+              WARN_MSG("SCTE35 splice_out value %" PRId64 " too small (< 1000ms) - ignoring", raw);
+            }else{
+              if (raw > 3600000) raw = 3600000;      // clamp: maximum 1 hour
+              uint64_t duration = (uint64_t)raw;
+              // Always send in-band SIS (needed for non-HLS TS outputs)
+              TS::SpliceInfoSection sis;
+              sis.randomizeSpliceID();
+              sis.writeSpliceDuration(duration);
+              sis.writeCRC();
+              fillPacket(sis.checkAndGetBuffer() + 4, 36, firstPack, false, true, pkgPid, contPkg);
+              // Signal HLS manifest to include CUE-OUT/CUE-IN tags (only for m3u8 outputs)
+              if (targetParams.count("m3u8")){
+                if (!inSpliceOut && !spliceOutPending){
+                  spliceOutPending = true;
+                  spliceInPending = true;
+                  spliceOutDuration = duration / 1000.0;  // ms -> seconds
+                }else{
+                  WARN_MSG("SCTE35 splice_out ignored: ad break %s",
+                           inSpliceOut ? "already active" : "already scheduled");
+                }
+              }
+            }
+          }
         }
       } else {
         long unsigned int tempLen = dataLen;
