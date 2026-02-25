@@ -182,6 +182,7 @@ namespace Mist{
     double spliceOutDuration = 0.0;
     uint64_t spliceStartTimeMs = 0;
     uint64_t spliceEndTimeMs = 0;
+    std::string spliceOutBase64;
 
     Event::Loop evLp;
 

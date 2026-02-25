@@ -1,5 +1,6 @@
 #include "output_ts_base.h"
 #include <mist/bitfields.h>
+#include <mist/encode.h>
 
 namespace Mist{
   TSOutput::TSOutput(Socket::Connection & conn, Util::Config & _cfg, JSON::Value & _capa)
@@ -10,6 +11,34 @@ namespace Mist{
     sendRepeatingHeaders = 0;
     lastHeaderTime = 0;
     maxSkipAhead = 0;
+  }
+
+  /// Extracts a base64-encoded SCTE-35 section from a TS packet.
+  /// Returns false if section boundaries are invalid.
+  static bool getScteSectionBase64(const TS::Packet &pkt, std::string &outB64){
+    const char *pktData = pkt.checkAndGetBuffer();
+    if (!pktData){return false;}
+
+    size_t payloadOffset = 4;
+    uint8_t adaptationFieldControl = ((uint8_t)pktData[3] >> 4) & 0x03;
+    if (!(adaptationFieldControl & 0x01)){return false;} // no payload present
+    if (adaptationFieldControl & 0x02){
+      uint8_t adaptationLen = (uint8_t)pktData[payloadOffset];
+      payloadOffset += (size_t)adaptationLen + 1;
+      if (payloadOffset >= 188){return false;}
+    }
+
+    uint8_t pointerField = (uint8_t)pktData[payloadOffset];
+    size_t sectionStart = payloadOffset + 1 + pointerField;
+    if (sectionStart + 3 > 188){return false;}
+
+    uint16_t sectionLen = (((uint16_t)((uint8_t)pktData[sectionStart + 1]) & 0x0F) << 8) |
+                          (uint16_t)((uint8_t)pktData[sectionStart + 2]);
+    size_t totalLen = (size_t)sectionLen + 3;
+    if (sectionStart + totalLen > 188){return false;}
+
+    outB64 = Encodings::Base64::encode(std::string(pktData + sectionStart, totalLen));
+    return outB64.size();
   }
 
   void TSOutput::fillPacket(char const *data, size_t dataLen, bool &firstPack, bool video,
@@ -250,13 +279,20 @@ namespace Mist{
               fillPacket(sis.checkAndGetBuffer() + 4, 36, firstPack, false, true, pkgPid, contPkg);
               // Signal HLS manifest to include CUE-OUT/CUE-IN tags (only for m3u8 outputs)
               if (targetParams.count("m3u8")){
-                if (!inSpliceOut && !spliceOutPending){
-                  spliceOutPending = true;
-                  spliceInPending = true;
-                  spliceOutDuration = duration / 1000.0;  // ms -> seconds
+                std::string sectionB64;
+                if (!getScteSectionBase64(sis, sectionB64)){
+                  WARN_MSG("SCTE35 splice_out ignored: failed to extract SCTE-35 section for manifest");
                 }else{
-                  WARN_MSG("SCTE35 splice_out ignored: ad break %s",
-                           inSpliceOut ? "already active" : "already scheduled");
+                  if (!inSpliceOut && !spliceOutPending){
+                    spliceOutPending = true;
+                    spliceInPending = true;
+                    spliceOutDuration = duration / 1000.0;  // ms -> seconds
+                    spliceOutBase64 = sectionB64;
+                    INFO_MSG("SCTE35: splice_out scheduled, duration=%.1fs", spliceOutDuration);
+                  }else{
+                    WARN_MSG("SCTE35 splice_out ignored: ad break %s",
+                             inSpliceOut ? "already active" : "already scheduled");
+                  }
                 }
               }
             }

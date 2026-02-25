@@ -670,7 +670,8 @@ namespace Mist{
         curDateString = line;
         continue;
       }
-      if (strncmp(line.c_str(), "#EXT-X-CUE-OUT", 14) == 0 ||
+      if (strncmp(line.c_str(), "#EXT-OATCLS-SCTE35", 18) == 0 ||
+          strncmp(line.c_str(), "#EXT-X-CUE-OUT", 14) == 0 ||
           strncmp(line.c_str(), "#EXT-X-CUE-IN", 13) == 0){
         curCueString += line + "\n";
         continue;
@@ -2066,29 +2067,44 @@ namespace Mist{
                 }
               }
               // SCTE-35 Ad Marker Injection
-              if (spliceInPending && inSpliceOut && currentStartTime >= spliceEndTimeMs){
-                playlistBuffer += "#EXT-X-CUE-IN\n";
+              if (inSpliceOut && currentStartTime >= spliceEndTimeMs){
                 spliceInPending = false;
                 inSpliceOut = false;
+                spliceOutBase64.clear();
               }
               if (spliceOutPending){
-                std::stringstream cueTag;
-                cueTag << "#EXT-X-CUE-OUT:DURATION=" << std::fixed
-                       << std::setprecision(1) << spliceOutDuration << "\n";
-                playlistBuffer += cueTag.str();
-                spliceOutPending = false;
-                spliceInPending = true;  // invariant: every CUE-OUT guarantees a CUE-IN
-                inSpliceOut = true;
-                spliceStartTimeMs = currentStartTime;
-                spliceEndTimeMs = currentStartTime + (uint64_t)(spliceOutDuration * 1000.0);
+                if (!spliceOutBase64.size()){
+                  WARN_MSG("SCTE35: splice_out dropped - missing SCTE payload for manifest");
+                  spliceOutPending = false;
+                  spliceInPending = false;
+                }else{
+                  playlistBuffer += "#EXT-OATCLS-SCTE35:" + spliceOutBase64 + "\n";
+                  std::stringstream cueTag;
+                  cueTag << "#EXT-X-CUE-OUT:" << std::fixed
+                         << std::setprecision(3) << spliceOutDuration << "\n";
+                  playlistBuffer += cueTag.str();
+                  spliceOutPending = false;
+                  spliceInPending = true;
+                  inSpliceOut = true;
+                  spliceStartTimeMs = currentStartTime;
+                  spliceEndTimeMs = currentStartTime + (uint64_t)(spliceOutDuration * 1000.0);
+                  INFO_MSG("SCTE35: CUE-OUT emitted, duration=%.3fs, endMs=%" PRIu64, spliceOutDuration, spliceEndTimeMs);
+                }
               }else if (inSpliceOut){
-                double elapsed = currentStartTime >= spliceStartTimeMs
-                    ? (currentStartTime - spliceStartTimeMs) / 1000.0 : 0.0;
-                std::stringstream contTag;
-                contTag << "#EXT-X-CUE-OUT-CONT:ElapsedTime=" << std::fixed
-                        << std::setprecision(1) << elapsed
-                        << ",Duration=" << spliceOutDuration << "\n";
-                playlistBuffer += contTag.str();
+                if (!spliceOutBase64.size()){
+                  WARN_MSG("SCTE35: active break has no payload, closing break state");
+                  spliceInPending = false;
+                  inSpliceOut = false;
+                }else{
+                  double elapsed = currentStartTime >= spliceStartTimeMs
+                      ? (currentStartTime - spliceStartTimeMs) / 1000.0 : 0.0;
+                  std::stringstream contTag;
+                  contTag << "#EXT-X-CUE-OUT-CONT:ElapsedTime=" << std::fixed
+                          << std::setprecision(3) << elapsed
+                          << ",Duration=" << spliceOutDuration
+                          << ",SCTE35=" << spliceOutBase64 << "\n";
+                  playlistBuffer += contTag.str();
+                }
               }
               INFO_MSG("Adding new segment `%s` of %" PRIu64 "ms to playlist '%s'", segment.c_str(), lastPacketTime - currentStartTime, playlistLocationString.c_str());
               // Append duration & TS filename to playlist file
@@ -2204,13 +2220,15 @@ namespace Mist{
           }
           // SCTE-35: Close any active ad break on final segment
           if (spliceOutPending){
-            WARN_MSG("SCTE35 splice_out pending at shutdown - dropped (no future segment for CUE-IN)");
+            WARN_MSG("SCTE35 splice_out pending at shutdown - dropped (no future segments)");
             spliceOutPending = false;
+            spliceInPending = false;
+            spliceOutBase64.clear();
           }
           if (inSpliceOut){
-            playlistBuffer += "#EXT-X-CUE-IN\n";
             spliceInPending = false;
             inSpliceOut = false;
+            spliceOutBase64.clear();
           }
           // Append duration & TS filename to playlist file
           std::stringstream tmp;
