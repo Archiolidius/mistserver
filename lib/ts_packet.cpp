@@ -61,6 +61,80 @@ namespace TS{
       0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
       0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+  std::string buildTimeSignalSection(uint8_t segTypeId, uint32_t eventId, uint64_t pts90k, uint64_t durationTicks90k){
+    if (segTypeId != 0x34 && segTypeId != 0x35){return "";}
+
+    const bool hasDuration = (segTypeId == 0x34 && durationTicks90k > 0);
+    const uint8_t descLen = hasDuration ? 20 : 15;
+    const uint16_t descLoopLen = hasDuration ? 22 : 17;
+
+    std::string section;
+    section.reserve(51);
+
+    // table_id + section length placeholder
+    section.push_back((char)0xFC);
+    section.push_back((char)0x30);
+    section.push_back((char)0x00);
+
+    section.push_back((char)0x00); // protocol_version
+    section.append(5, '\x00'); // encrypted packet + pts_adjustment
+    section.push_back((char)0x00); // cw_index
+
+    // tier (0xFFF) + splice_command_length (5)
+    section.push_back((char)0xFF);
+    section.push_back((char)0xF0);
+    section.push_back((char)0x05);
+
+    section.push_back((char)0x06); // splice_command_type: time_signal
+    const uint64_t pts = pts90k & 0x1FFFFFFFFull;
+    section.push_back((char)(0xFE | ((pts >> 32) & 0x01))); // time_specified=1 + reserved bits
+    section.push_back((char)((pts >> 24) & 0xFF));
+    section.push_back((char)((pts >> 16) & 0xFF));
+    section.push_back((char)((pts >> 8) & 0xFF));
+    section.push_back((char)(pts & 0xFF));
+
+    // descriptor_loop_length
+    section.push_back((char)((descLoopLen >> 8) & 0xFF));
+    section.push_back((char)(descLoopLen & 0xFF));
+
+    // segmentation_descriptor
+    section.push_back((char)0x02); // splice_descriptor_tag
+    section.push_back((char)descLen); // descriptor_length
+    section.append("CUEI", 4); // identifier
+    section.push_back((char)((eventId >> 24) & 0xFF));
+    section.push_back((char)((eventId >> 16) & 0xFF));
+    section.push_back((char)((eventId >> 8) & 0xFF));
+    section.push_back((char)(eventId & 0xFF));
+    section.push_back((char)0x7F); // segmentation_event_cancel_indicator = 0, reserved
+    section.push_back((char)(hasDuration ? 0xFF : 0xBF)); // flags: prog=1, dur=hasDuration, unrestricted
+
+    if (hasDuration){
+      const uint64_t dur40 = durationTicks90k & 0xFFFFFFFFFFull;
+      section.push_back((char)((dur40 >> 32) & 0xFF));
+      section.push_back((char)((dur40 >> 24) & 0xFF));
+      section.push_back((char)((dur40 >> 16) & 0xFF));
+      section.push_back((char)((dur40 >> 8) & 0xFF));
+      section.push_back((char)(dur40 & 0xFF));
+    }
+
+    section.push_back((char)0x00); // segmentation_upid_type (not used)
+    section.push_back((char)0x00); // segmentation_upid_length
+    section.push_back((char)segTypeId); // 0x34 start / 0x35 end
+    section.push_back((char)0x00); // segment_num
+    section.push_back((char)0x00); // segments_expected
+
+    // section_length counts bytes after this field up to and including CRC
+    const uint16_t sectionLen = (uint16_t)((section.size() - 3) + 4);
+    section[1] = (char)(0x30 | ((sectionLen >> 8) & 0x0F));
+    section[2] = (char)(sectionLen & 0xFF);
+
+    const uint32_t crc = checksum::crc32(-1, section.data(), section.size());
+    char crcBytes[4];
+    Bit::htobl_le(crcBytes, crc);
+    section.append(crcBytes, 4);
+    return section;
+  }
+
   /// This constructor creates an empty Packet, ready for use for either reading or writing.
   /// All this constructor does is call Packet::clear().
   Packet::Packet(){

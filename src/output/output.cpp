@@ -2068,15 +2068,24 @@ namespace Mist{
               }
               // SCTE-35 Ad Marker Injection
               if (inSpliceOut && currentStartTime >= spliceEndTimeMs){
-                spliceInPending = false;
+                if (spliceInBase64.size()){
+                  playlistBuffer += "#EXT-OATCLS-SCTE35:" + spliceInBase64 + "\n";
+                }else{
+                  WARN_MSG("SCTE35: closing break without in-payload");
+                }
+                playlistBuffer += "#EXT-X-CUE-IN\n";
                 inSpliceOut = false;
                 spliceOutBase64.clear();
+                spliceInBase64.clear();
+                spliceEventId = 0;
               }
               if (spliceOutPending){
-                if (!spliceOutBase64.size()){
-                  WARN_MSG("SCTE35: splice_out dropped - missing SCTE payload for manifest");
+                if (!spliceOutBase64.size() || !spliceInBase64.size()){
+                  WARN_MSG("SCTE35: splice_out dropped - missing enhanced SCTE payload for manifest");
                   spliceOutPending = false;
-                  spliceInPending = false;
+                  spliceOutBase64.clear();
+                  spliceInBase64.clear();
+                  spliceEventId = 0;
                 }else{
                   playlistBuffer += "#EXT-OATCLS-SCTE35:" + spliceOutBase64 + "\n";
                   std::stringstream cueTag;
@@ -2084,17 +2093,22 @@ namespace Mist{
                          << std::setprecision(3) << spliceOutDuration << "\n";
                   playlistBuffer += cueTag.str();
                   spliceOutPending = false;
-                  spliceInPending = true;
                   inSpliceOut = true;
                   spliceStartTimeMs = currentStartTime;
                   spliceEndTimeMs = currentStartTime + (uint64_t)(spliceOutDuration * 1000.0);
-                  INFO_MSG("SCTE35: CUE-OUT emitted, duration=%.3fs, endMs=%" PRIu64, spliceOutDuration, spliceEndTimeMs);
+                  INFO_MSG("SCTE35: CUE-OUT emitted, duration=%.3fs, endMs=%" PRIu64 ", eventId=%u", spliceOutDuration, spliceEndTimeMs, spliceEventId);
                 }
               }else if (inSpliceOut){
                 if (!spliceOutBase64.size()){
-                  WARN_MSG("SCTE35: active break has no payload, closing break state");
-                  spliceInPending = false;
+                  WARN_MSG("SCTE35: active break has no out-payload, forcing close");
+                  if (spliceInBase64.size()){
+                    playlistBuffer += "#EXT-OATCLS-SCTE35:" + spliceInBase64 + "\n";
+                  }
+                  playlistBuffer += "#EXT-X-CUE-IN\n";
                   inSpliceOut = false;
+                  spliceOutBase64.clear();
+                  spliceInBase64.clear();
+                  spliceEventId = 0;
                 }else{
                   double elapsed = currentStartTime >= spliceStartTimeMs
                       ? (currentStartTime - spliceStartTimeMs) / 1000.0 : 0.0;
@@ -2222,13 +2236,21 @@ namespace Mist{
           if (spliceOutPending){
             WARN_MSG("SCTE35 splice_out pending at shutdown - dropped (no future segments)");
             spliceOutPending = false;
-            spliceInPending = false;
             spliceOutBase64.clear();
+            spliceInBase64.clear();
+            spliceEventId = 0;
           }
           if (inSpliceOut){
-            spliceInPending = false;
+            if (spliceInBase64.size()){
+              playlistBuffer += "#EXT-OATCLS-SCTE35:" + spliceInBase64 + "\n";
+            }else{
+              WARN_MSG("SCTE35: closing break at shutdown without in-payload");
+            }
+            playlistBuffer += "#EXT-X-CUE-IN\n";
             inSpliceOut = false;
             spliceOutBase64.clear();
+            spliceInBase64.clear();
+            spliceEventId = 0;
           }
           // Append duration & TS filename to playlist file
           std::stringstream tmp;

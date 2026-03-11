@@ -13,34 +13,6 @@ namespace Mist{
     maxSkipAhead = 0;
   }
 
-  /// Extracts a base64-encoded SCTE-35 section from a TS packet.
-  /// Returns false if section boundaries are invalid.
-  static bool getScteSectionBase64(const TS::Packet &pkt, std::string &outB64){
-    const char *pktData = pkt.checkAndGetBuffer();
-    if (!pktData){return false;}
-
-    size_t payloadOffset = 4;
-    uint8_t adaptationFieldControl = ((uint8_t)pktData[3] >> 4) & 0x03;
-    if (!(adaptationFieldControl & 0x01)){return false;} // no payload present
-    if (adaptationFieldControl & 0x02){
-      uint8_t adaptationLen = (uint8_t)pktData[payloadOffset];
-      payloadOffset += (size_t)adaptationLen + 1;
-      if (payloadOffset >= 188){return false;}
-    }
-
-    uint8_t pointerField = (uint8_t)pktData[payloadOffset];
-    size_t sectionStart = payloadOffset + 1 + pointerField;
-    if (sectionStart + 3 > 188){return false;}
-
-    uint16_t sectionLen = (((uint16_t)((uint8_t)pktData[sectionStart + 1]) & 0x0F) << 8) |
-                          (uint16_t)((uint8_t)pktData[sectionStart + 2]);
-    size_t totalLen = (size_t)sectionLen + 3;
-    if (sectionStart + totalLen > 188){return false;}
-
-    outB64 = Encodings::Base64::encode(std::string(pktData + sectionStart, totalLen));
-    return outB64.size();
-  }
-
   void TSOutput::fillPacket(char const *data, size_t dataLen, bool &firstPack, bool video,
                             bool keyframe, size_t pkgPid, uint16_t &contPkg){
     do{
@@ -279,20 +251,33 @@ namespace Mist{
               fillPacket(sis.checkAndGetBuffer() + 4, 36, firstPack, false, true, pkgPid, contPkg);
               // Signal HLS manifest to include CUE-OUT/CUE-IN tags (only for m3u8 outputs)
               if (targetParams.count("m3u8")){
-                std::string sectionB64;
-                if (!getScteSectionBase64(sis, sectionB64)){
-                  WARN_MSG("SCTE35 splice_out ignored: failed to extract SCTE-35 section for manifest");
-                }else{
-                  if (!inSpliceOut && !spliceOutPending){
-                    spliceOutPending = true;
-                    spliceInPending = true;
-                    spliceOutDuration = duration / 1000.0;  // ms -> seconds
-                    spliceOutBase64 = sectionB64;
-                    INFO_MSG("SCTE35: splice_out scheduled, duration=%.1fs", spliceOutDuration);
+                if (!inSpliceOut && !spliceOutPending){
+                  char eventIdRaw[4];
+                  Util::getRandomBytes(eventIdRaw, 4);
+                  spliceEventId = ((uint32_t)(uint8_t)eventIdRaw[0] << 24) |
+                                  ((uint32_t)(uint8_t)eventIdRaw[1] << 16) |
+                                  ((uint32_t)(uint8_t)eventIdRaw[2] << 8) |
+                                  ((uint32_t)(uint8_t)eventIdRaw[3]);
+                  std::string outSection =
+                      TS::buildTimeSignalSection(0x34, spliceEventId, packTime, duration * 90);
+                  std::string inSection =
+                      TS::buildTimeSignalSection(0x35, spliceEventId, packTime + duration * 90, 0);
+                  spliceOutBase64 = Encodings::Base64::encode(outSection);
+                  spliceInBase64 = Encodings::Base64::encode(inSection);
+                  if (!spliceOutBase64.size() || !spliceInBase64.size()){
+                    WARN_MSG("SCTE35 splice_out ignored: failed to build enhanced manifest payloads");
+                    spliceOutBase64.clear();
+                    spliceInBase64.clear();
+                    spliceEventId = 0;
                   }else{
-                    WARN_MSG("SCTE35 splice_out ignored: ad break %s",
-                             inSpliceOut ? "already active" : "already scheduled");
+                    spliceOutPending = true;
+                    spliceOutDuration = duration / 1000.0;  // ms -> seconds
+                    INFO_MSG("SCTE35: splice_out scheduled, duration=%.3fs, eventId=%u",
+                             spliceOutDuration, spliceEventId);
                   }
+                }else{
+                  WARN_MSG("SCTE35 splice_out ignored: ad break %s",
+                           inSpliceOut ? "already active" : "already scheduled");
                 }
               }
             }

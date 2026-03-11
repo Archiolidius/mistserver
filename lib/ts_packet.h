@@ -246,6 +246,10 @@ namespace TS{
       std::string toPrettyString(size_t indent) const;
   };
 
+  /// Builds a raw SCTE-35 time_signal section (table_id through CRC).
+  /// segTypeId is expected to be 0x34 (start) or 0x35 (end).
+  std::string buildTimeSignalSection(uint8_t segTypeId, uint32_t eventId, uint64_t pts90k, uint64_t durationTicks90k);
+
   /// Constructs an audio header to be used on each audio frame.
   /// The length of this header will ALWAYS be 7 bytes, and has to be
   /// prepended on each audio frame.

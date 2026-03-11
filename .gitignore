@@ -71,3 +71,4 @@ subprojects/
 !subprojects/packagefiles/
 !subprojects/*.wrap
 .vscode/
+scte35-youtube-debug-report.md
