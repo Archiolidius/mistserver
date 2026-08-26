@@ -1264,8 +1264,6 @@ Socket::Connection::Connection(std::string host, int port, bool nonblock, bool w
   open(host, port, nonblock, with_ssl);
 }
 
-/// Open TCP connection.
-/// Closes any existing connections and resets all internal values beforehand.
 #ifdef SSL
 /// Frees the SSL context objects allocated by open() when a secure connection attempt
 /// fails before the handshake completed, closing the underlying fd (held inside the
@@ -1326,6 +1324,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
     if (mbedtls_ctr_drbg_seed(ctr_drbg, mbedtls_entropy_func, entropy, (const unsigned char *)"meow", 4) != 0){
       lastErr = "SSL socket init failed";
       FAIL_MSG("SSL socket init failed");
+      sslPreConnectCleanup();
       close();
       return;
     }
@@ -1346,6 +1345,12 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
   if (s != 0){
     lastErr = gai_strmagic(s);
     FAIL_MSG("Could not connect to %s:%i! Error: %s", host.c_str(), port, lastErr.c_str());
+#ifdef SSL
+    // A DNS failure happens after the SSL contexts were allocated above, and
+    // drop()/close() cannot free them while sslConnected is still false. Without
+    // this, a retrying caller leaks one context set per attempt.
+    if (with_ssl){sslPreConnectCleanup();}
+#endif
     close();
     return;
   }
@@ -1443,6 +1448,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
       mbedtls_strerror(ret, estr, 200);
       lastErr = estr;
       FAIL_MSG("SSL config failed: %d: %s", ret, lastErr.c_str());
+      sslPreConnectCleanup();
       close();
       return;
     }
@@ -1454,6 +1460,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
       mbedtls_strerror(ret, estr, 200);
       lastErr = estr;
       FAIL_MSG("SSL setup error %d: %s", ret, lastErr.c_str());
+      sslPreConnectCleanup();
       close();
       return;
     }
@@ -1467,6 +1474,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
       mbedtls_strerror(ret, estr, 200);
       lastErr = estr;
       FAIL_MSG("SSL setup error %d: %s", ret, lastErr.c_str());
+      sslPreConnectCleanup();
       close();
       return;
     }
@@ -1512,6 +1520,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
         mbedtls_strerror(ret, estr, 200);
         lastErr = estr;
         FAIL_MSG("SSL handshake error %d: %s", ret, lastErr.c_str());
+        sslPreConnectCleanup();
         close();
         return;
       }

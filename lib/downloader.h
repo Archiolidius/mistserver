@@ -29,9 +29,11 @@ namespace HTTP{
     bool post(const HTTP::URL &link, const std::string &payload, bool sync = true,
               uint8_t maxRecursiveDepth = 6);
 
-    /// deadlineMS: optional absolute Util::bootMS() deadline bounding the whole PUT
-    /// operation (connect, TLS handshake, 100-continue wait, retries and backoff).
-    /// 0 = legacy blocking behavior, byte-for-byte.
+    /// deadlineMS: optional absolute Util::bootMS() deadline bounding everything up to
+    /// and including the 100-continue reply: TCP connect, TLS handshake, the wait for
+    /// "100 Continue", retries and their backoff. It does NOT cover the body upload -
+    /// the socket goes back to blocking once the server has approved the request - and
+    /// DNS resolution is a documented overshoot. 0 = legacy blocking behavior.
     bool startPut(const HTTP::URL & link, Socket::Connection & conn, uint8_t maxRecursiveDepth = 6,
                   uint64_t deadlineMS = 0);
 

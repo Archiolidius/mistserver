@@ -1669,11 +1669,28 @@ namespace Mist{
     bool plsRecovery = false;
     const uint64_t plsRecoveryCapMS = 20000;
     uint64_t lastPlaylistConfirmMS = 0;
-    // Pairing note: at segment boundary K+1 the playlist finalize confirms the playlist
-    // written at boundary K, and this flag still holds the result of boundary K's
-    // segment open (it is updated only later in the same boundary block), so the
-    // confirmed-playlist + successful-segment test is cycle-aligned by construction.
-    bool lastSegmentOpenOk = true;
+    // Deliberately lags one cycle: at segment boundary K+1 the playlist finalize
+    // confirms the playlist written at boundary K, and this flag still holds the
+    // result of boundary K's segment open (it is updated only later in the same
+    // boundary block), so the confirmed-playlist + successful-segment test is
+    // cycle-aligned by construction.
+    bool prevCycleSegmentOpenOk = true;
+    // Same one-cycle lag: false when the previous segment's upload finalized with a
+    // transient failure (5xx, reset, no reply). Without this an endpoint that answers
+    // playlists 2xx while rejecting every segment body would reset the clock forever.
+    bool prevCycleSegmentSentOk = true;
+    // Single exit for every recovery-mode cap expiry: logs, closes the playlist
+    // connection (so the shutdown flush cannot start another PUT into the outage
+    // that caused the teardown) and tells the caller to break out of the loop.
+    auto capReached = [&]() -> bool {
+      if (Util::bootMS() < lastPlaylistConfirmMS + plsRecoveryCapMS){return false;}
+      FAIL_MSG("No confirmed playlist write for %" PRIu64 " ms - stopping push: %s",
+               Util::bootMS() - lastPlaylistConfirmMS, playlistLocationString.c_str());
+      Util::logExitReason(ER_WRITE_FAILURE, "no confirmed playlist write within %" PRIu64 " ms: %s",
+                          plsRecoveryCapMS, playlistLocationString.c_str());
+      plsConn.close();
+      return true;
+    };
 
     std::string origTarget; 
     const char* origTargetPtr = getenv("MST_ORIG_TARGET");
@@ -1866,6 +1883,12 @@ namespace Mist{
             if (!maxEntries && !targetAge) {playlistBuffer = "";}
           }
           lastPlaylistConfirmMS = Util::bootMS(); // recovery failure-clock baseline
+        }else if (plsRecovery){
+          // Non-live source: the playlist is written once at the end, so the failure
+          // clock above never gets a baseline and would read as already expired.
+          // Recovery is a live-push feature; keep today's code path for these.
+          plsRecovery = false;
+          INFO_MSG("Playlist recovery disabled: source is not live");
         }
       }
       currentStartTime = currentTime();
@@ -2206,6 +2229,13 @@ namespace Mist{
                   // at the next segment boundary.
                   uint64_t capDeadline = lastPlaylistConfirmMS + plsRecoveryCapMS;
                   Util::PutFinalizeResult fin = Util::finalizePreviousUpload(plsConn, playlistLocationString, capDeadline);
+                  // A confirmed 2xx is proof of ingestion, so credit it before testing the
+                  // cap: an outage that ends inside the last seconds of the window must not
+                  // tear the push down on evidence that already arrived.
+                  if (fin == Util::PUT_FIN_OK_2XX && prevCycleSegmentOpenOk && prevCycleSegmentSentOk){
+                    lastPlaylistConfirmMS = Util::bootMS();
+                    capDeadline = lastPlaylistConfirmMS + plsRecoveryCapMS;
+                  }
                   if (fin == Util::PUT_FIN_PERMANENT){
                     FAIL_MSG("Playlist upload permanently rejected for `%s` - stopping push", playlistLocationString.c_str());
                     Util::logExitReason(ER_WRITE_FAILURE, "playlist upload permanently rejected (4xx): %s", playlistLocationString.c_str());
@@ -2214,14 +2244,7 @@ namespace Mist{
                   }
                   // The remaining cap budget is threaded down as the PUT deadline, so a
                   // single open attempt can never overshoot the cap.
-                  if (Util::bootMS() >= capDeadline){
-                    FAIL_MSG("No confirmed playlist write for %" PRIu64 " ms - stopping push: %s",
-                             Util::bootMS() - lastPlaylistConfirmMS, playlistLocationString.c_str());
-                    Util::logExitReason(ER_WRITE_FAILURE, "no confirmed playlist write within %" PRIu64 " ms: %s",
-                                        plsRecoveryCapMS, playlistLocationString.c_str());
-                    plsConn.close();
-                    break;
-                  }
+                  if (capReached()){break;}
                   bool plsOpened = Util::openNextUpload(playlistLocationString, plsConn, false, capDeadline);
                   if (plsOpened){
                     plsConn.SendNow(playlistBuffer);
@@ -2229,20 +2252,16 @@ namespace Mist{
                     WARN_MSG("Playlist write skipped (open failed); retrying at the next segment boundary: %s",
                              playlistLocationString.c_str());
                   }
-                  // Failure-clock evidence: a confirmed 2xx is proof of ingestion; a
-                  // silent-but-still-open final response combined with the next PUT being
-                  // approved (100-continue) also proves the endpoint is alive and accepting.
-                  // Without the latter, an edge that acks lazily would trip the cap on a
-                  // perfectly healthy stream. Both require the previous cycle's segment
-                  // open to have succeeded (cycle-aligned, see lastSegmentOpenOk note).
-                  if ((fin == Util::PUT_FIN_OK_2XX || fin == Util::PUT_FIN_NO_RESPONSE) && plsOpened && lastSegmentOpenOk){
+                  // A silent-but-still-open final response is weaker evidence than a 2xx,
+                  // so it only counts when the next PUT was also approved (100-continue):
+                  // together they prove the endpoint is alive and accepting. Without this,
+                  // an edge that acks lazily would trip the cap on a healthy stream. Both
+                  // forms of evidence also require the previous cycle's segment to have
+                  // opened AND finalized cleanly, so a backend that accepts playlists while
+                  // rejecting every segment body still reaches the cap.
+                  if (fin == Util::PUT_FIN_NO_RESPONSE && plsOpened && prevCycleSegmentOpenOk && prevCycleSegmentSentOk){
                     lastPlaylistConfirmMS = Util::bootMS();
-                  }else if (Util::bootMS() >= capDeadline){
-                    FAIL_MSG("No confirmed playlist write for %" PRIu64 " ms - stopping push: %s",
-                             Util::bootMS() - lastPlaylistConfirmMS, playlistLocationString.c_str());
-                    Util::logExitReason(ER_WRITE_FAILURE, "no confirmed playlist write within %" PRIu64 " ms: %s",
-                                        plsRecoveryCapMS, playlistLocationString.c_str());
-                    plsConn.close();
+                  }else if (fin != Util::PUT_FIN_OK_2XX && capReached()){
                     break;
                   }
                 }
@@ -2273,6 +2292,10 @@ namespace Mist{
               // Same split as the playlist site: finalize (bounded by the remaining cap
               // budget), then open with that budget threaded down as the PUT deadline.
               Util::PutFinalizeResult segFin = Util::finalizePreviousUpload(myConn, newTarget, lastPlaylistConfirmMS + plsRecoveryCapMS);
+              // Recorded now, read at the next boundary. NONE means there was nothing to
+              // finalize (first cycle, or the previous open failed) and is not evidence
+              // of a rejection, so it does not count against the clock here.
+              prevCycleSegmentSentOk = (segFin != Util::PUT_FIN_TRANSIENT);
               if (segFin == Util::PUT_FIN_PERMANENT){
                 FAIL_MSG("Segment upload permanently rejected for `%s` - stopping push", newTarget.c_str());
                 Util::logExitReason(ER_WRITE_FAILURE, "segment upload permanently rejected (4xx): %s", newTarget.c_str());
@@ -2294,22 +2317,18 @@ namespace Mist{
               // Recovery mode: this segment's data is lost either way, but tearing the
               // whole push down would cost strictly more. Attach the output to /dev/null
               // for this cycle (keepGoing() requires a live myConn) and count the failure
-              // against the unconfirmed-write cap via lastSegmentOpenOk. The next segment
-              // boundary re-attempts a real connection.
-              lastSegmentOpenOk = false;
-              if (Util::bootMS() >= lastPlaylistConfirmMS + plsRecoveryCapMS){
-                FAIL_MSG("No confirmed playlist write for %" PRIu64 " ms - stopping push: %s",
-                         Util::bootMS() - lastPlaylistConfirmMS, playlistLocationString.c_str());
-                Util::logExitReason(ER_WRITE_FAILURE, "no confirmed playlist write within %" PRIu64 " ms: %s",
-                                    plsRecoveryCapMS, playlistLocationString.c_str());
-                plsConn.close();
+              // against the unconfirmed-write cap. The next segment boundary re-attempts
+              // a real connection.
+              prevCycleSegmentOpenOk = false; // recorded now, read at the next boundary
+              if (capReached()){
                 onFinish();
                 break;
               }
               int devNull = open("/dev/null", O_WRONLY);
               if (devNull < 0){
                 FAIL_MSG("Failed to open segment target and /dev/null fallback, aborting: %s", newTarget.c_str());
-                Util::logExitReason(ER_WRITE_FAILURE, "failed to open file, aborting: %s", newTarget.c_str());
+                Util::logExitReason(ER_WRITE_FAILURE, "segment target and /dev/null fallback both failed: %s", newTarget.c_str());
+                plsConn.close();
                 onFinish();
                 break;
               }
@@ -2317,7 +2336,7 @@ namespace Mist{
               myConn.open(devNull, -1);
               myConn.setChunkedMode(false);
             } else if (plsRecovery) {
-              lastSegmentOpenOk = true;
+              prevCycleSegmentOpenOk = true; // recorded now, read at the next boundary
             }
             uint64_t endRec = thisTime + atoll(targetParams["split"].c_str()) * 1000;
             targetParams["nxt-split"] = JSON::Value(endRec).asString();

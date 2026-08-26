@@ -313,7 +313,16 @@ namespace Util{
         } else {
           WARN_MSG("Non-2xx server response to upload (before %s): %s %s (after %" PRIu64 " ms)",
                    uriHint.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
-          result = (response.url.size() && response.url[0] == '5') ? PUT_FIN_TRANSIENT : PUT_FIN_PERMANENT;
+          // Only a genuine client-side rejection is permanent. 5xx, 408 (timeout) and
+          // 429 (rate limited) are retryable, and an informational 1xx is not a verdict
+          // at all - classifying any of those as permanent would tear down a push that
+          // the endpoint is willing to keep serving.
+          std::string code = response.url;
+          if (code.size() && code[0] == '4' && code != "408" && code != "429") {
+            result = PUT_FIN_PERMANENT;
+          } else {
+            result = PUT_FIN_TRANSIENT;
+          }
         }
         gotResponse = true;
       }
@@ -415,13 +424,26 @@ namespace Util{
       target = HTTP::injectHeaders(target, "PUT", dl);
       // Optional overall deadline for the whole PUT operation (connect, TLS handshake,
       // 100-continue wait, retries and backoff). MIST_PUT_DEADLINE_MS unset or 0 keeps
-      // the legacy blocking behavior byte-for-byte.
+      // the legacy blocking behavior byte-for-byte. Values outside 1000-600000 ms, or
+      // any value that is not a plain integer, are rejected with a warning and disable
+      // the mode: a typo like "1e5" would otherwise parse as a 1 ms budget and fail
+      // every single upload.
       static int64_t putBudgetMS = -1;
       if (putBudgetMS < 0) {
+        putBudgetMS = 0;
         const char *envBudget = getenv("MIST_PUT_DEADLINE_MS");
-        putBudgetMS = envBudget ? atoll(envBudget) : 0;
-        if (putBudgetMS < 0) { putBudgetMS = 0; }
-        if (putBudgetMS) { INFO_MSG("PUT deadline mode active: %" PRId64 " ms budget per upload", putBudgetMS); }
+        if (envBudget && *envBudget) {
+          char *endPtr = 0;
+          long long parsed = strtoll(envBudget, &endPtr, 10);
+          if (!*endPtr && parsed == 0) {
+            // Explicit "0" is the documented way to keep legacy behavior: stay silent.
+          } else if (*endPtr || parsed < 1000 || parsed > 600000) {
+            WARN_MSG("Ignoring MIST_PUT_DEADLINE_MS='%s' (needs a plain integer of 1000-600000 ms)", envBudget);
+          } else {
+            putBudgetMS = parsed;
+            INFO_MSG("PUT deadline mode active: %" PRId64 " ms budget per upload", putBudgetMS);
+          }
+        }
       }
       uint64_t putDeadline = putBudgetMS ? Util::bootMS() + putBudgetMS : 0;
       // A caller-provided deadline can only tighten the budget, never extend it.

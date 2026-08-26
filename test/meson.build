@@ -13,6 +13,17 @@ downloadertest = executable('downloadertest', 'downloader.cpp', header_tgts, dep
 test('event-looped non-blocking', downloadertest, args: ['AUTO'], env: {'EVENTLOOP':'1'}, suite: 'Downloader')
 test('blocking', downloadertest, args: ['AUTO'], suite: 'Downloader')
 
+# Chunked-PUT upload path (used by HLS push targets): 100-continue handling,
+# deadline and retry policy in startPut, final-status classification in
+# Util::finalizePreviousUpload.
+downloaderputtest = executable('downloaderputtest', 'downloader_put.cpp', header_tgts, dependencies: libmist_dep)
+test('final 2xx and 4xx classification', downloaderputtest, args: ['ok403'], suite: 'Downloader PUT')
+test('final 5xx is transient', downloaderputtest, args: ['500'], suite: 'Downloader PUT')
+test('no final response respects the deadline', downloaderputtest, args: ['quiet'], suite: 'Downloader PUT')
+test('5xx at open retries in place', downloaderputtest, args: ['deny500retry'], suite: 'Downloader PUT')
+test('4xx at open fails immediately', downloaderputtest, args: ['deny403'], suite: 'Downloader PUT')
+test('silent server cannot hang the pusher', downloaderputtest, args: ['deadline'], suite: 'Downloader PUT')
+
 
 # The only argument is simply the 'alg' parameter value as defined in the JWA spec (RFC7518)
 jwttest = executable('jwttest', 'jwt.cpp', header_tgts, dependencies: libmist_dep)
