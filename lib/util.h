@@ -30,7 +30,9 @@ namespace Util{
     PUT_FIN_PERMANENT,  ///< Non-2xx, non-5xx final status (e.g. 403/404)
     PUT_FIN_NO_RESPONSE ///< Connection stayed open but no final response arrived in time
   };
-  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint = "");
+  /// deadlineMS: optional absolute Util::bootMS() deadline that can only shorten the
+  /// default 5 s wait for the final response (0 = the legacy 5 s wait).
+  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint = "", uint64_t deadlineMS = 0);
   /// deadlineMS: optional absolute Util::bootMS() deadline for HTTP(S) targets; the
   /// effective PUT deadline is the earlier of this and the MIST_PUT_DEADLINE_MS budget.
   bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append = false, uint64_t deadlineMS = 0);

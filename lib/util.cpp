@@ -294,7 +294,7 @@ namespace Util{
   /// classifies it, and closes the connection. Timing and logging are identical to the
   /// historical externalWriter behavior; the classification is returned instead of
   /// being discarded.
-  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint) {
+  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint, uint64_t deadlineMS) {
     if (!conn || !conn.isChunkedMode()) { return PUT_FIN_NONE; }
     uint64_t finalizeStart = Util::bootMS();
     conn.SendNow(0, 0);
@@ -323,6 +323,8 @@ namespace Util{
       while (conn.spool()) { attemptFinish(); }
     }, 0);
     uint64_t maxWait = Util::bootMS() + 5000;
+    // A caller-provided deadline can only shorten the wait, never extend it.
+    if (deadlineMS && deadlineMS < maxWait) { maxWait = deadlineMS; }
     attemptFinish();
     while (!gotResponse && Util::bootMS() < maxWait) { ev.await(1000); }
     if (!gotResponse) {

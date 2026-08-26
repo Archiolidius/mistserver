@@ -1669,6 +1669,10 @@ namespace Mist{
     bool plsRecovery = false;
     const uint64_t plsRecoveryCapMS = 20000;
     uint64_t lastPlaylistConfirmMS = 0;
+    // Pairing note: at segment boundary K+1 the playlist finalize confirms the playlist
+    // written at boundary K, and this flag still holds the result of boundary K's
+    // segment open (it is updated only later in the same boundary block), so the
+    // confirmed-playlist + successful-segment test is cycle-aligned by construction.
     bool lastSegmentOpenOk = true;
 
     std::string origTarget; 
@@ -1736,6 +1740,12 @@ namespace Mist{
         if (playlistLocation.isLocalPath()){
           playlistLocationString = playlistLocation.getFilePath();
           INFO_MSG("Segmenting to local playlist '%s'", playlistLocationString.c_str());
+          if (plsRecovery){
+            // Recovery semantics depend on HTTP finalize results; a local playlist would
+            // starve the failure clock (finalize always returns none) and self-terminate.
+            plsRecovery = false;
+            INFO_MSG("Playlist recovery disabled: local playlist target");
+          }
           // Check if we already have a playlist at the target location
           std::ifstream inFile(playlistLocationString.c_str());
           if (inFile.good()){
@@ -2190,40 +2200,49 @@ namespace Mist{
                     plsConn.SendNow(playlistBuffer);
                   }
                 } else {
-                  // Playlist recovery mode. Finalize the previous playlist upload and key
-                  // the failure clock on its result: only a confirmed 2xx (with the
-                  // previous cycle's segment open successful) resets the clock. Then open
-                  // the next upload; on failure keep playlistBuffer intact (it holds the
-                  // complete sliding window) and retry at the next segment boundary.
-                  Util::PutFinalizeResult fin = Util::finalizePreviousUpload(plsConn, playlistLocationString);
-                  if (fin == Util::PUT_FIN_OK_2XX && lastSegmentOpenOk){
-                    lastPlaylistConfirmMS = Util::bootMS();
-                  }else if (fin == Util::PUT_FIN_PERMANENT){
+                  // Playlist recovery mode. Finalize the previous playlist upload (bounded
+                  // by the remaining cap budget), then open the next upload; on failure keep
+                  // playlistBuffer intact (it holds the complete sliding window) and retry
+                  // at the next segment boundary.
+                  uint64_t capDeadline = lastPlaylistConfirmMS + plsRecoveryCapMS;
+                  Util::PutFinalizeResult fin = Util::finalizePreviousUpload(plsConn, playlistLocationString, capDeadline);
+                  if (fin == Util::PUT_FIN_PERMANENT){
                     FAIL_MSG("Playlist upload permanently rejected for `%s` - stopping push", playlistLocationString.c_str());
                     Util::logExitReason(ER_WRITE_FAILURE, "playlist upload permanently rejected (4xx): %s", playlistLocationString.c_str());
+                    plsConn.close();
                     break;
                   }
                   // The remaining cap budget is threaded down as the PUT deadline, so a
                   // single open attempt can never overshoot the cap.
-                  uint64_t capDeadline = lastPlaylistConfirmMS + plsRecoveryCapMS;
                   if (Util::bootMS() >= capDeadline){
                     FAIL_MSG("No confirmed playlist write for %" PRIu64 " ms - stopping push: %s",
                              Util::bootMS() - lastPlaylistConfirmMS, playlistLocationString.c_str());
                     Util::logExitReason(ER_WRITE_FAILURE, "no confirmed playlist write within %" PRIu64 " ms: %s",
                                         plsRecoveryCapMS, playlistLocationString.c_str());
+                    plsConn.close();
                     break;
                   }
-                  if (Util::openNextUpload(playlistLocationString, plsConn, false, capDeadline)){
+                  bool plsOpened = Util::openNextUpload(playlistLocationString, plsConn, false, capDeadline);
+                  if (plsOpened){
                     plsConn.SendNow(playlistBuffer);
                   }else{
                     WARN_MSG("Playlist write skipped (open failed); retrying at the next segment boundary: %s",
                              playlistLocationString.c_str());
                   }
-                  if (Util::bootMS() >= capDeadline){
+                  // Failure-clock evidence: a confirmed 2xx is proof of ingestion; a
+                  // silent-but-still-open final response combined with the next PUT being
+                  // approved (100-continue) also proves the endpoint is alive and accepting.
+                  // Without the latter, an edge that acks lazily would trip the cap on a
+                  // perfectly healthy stream. Both require the previous cycle's segment
+                  // open to have succeeded (cycle-aligned, see lastSegmentOpenOk note).
+                  if ((fin == Util::PUT_FIN_OK_2XX || fin == Util::PUT_FIN_NO_RESPONSE) && plsOpened && lastSegmentOpenOk){
+                    lastPlaylistConfirmMS = Util::bootMS();
+                  }else if (Util::bootMS() >= capDeadline){
                     FAIL_MSG("No confirmed playlist write for %" PRIu64 " ms - stopping push: %s",
                              Util::bootMS() - lastPlaylistConfirmMS, playlistLocationString.c_str());
                     Util::logExitReason(ER_WRITE_FAILURE, "no confirmed playlist write within %" PRIu64 " ms: %s",
                                         plsRecoveryCapMS, playlistLocationString.c_str());
+                    plsConn.close();
                     break;
                   }
                 }
@@ -2251,9 +2270,16 @@ namespace Mist{
             INFO_MSG("Switching to next push target filename: %s", newTarget.c_str());
             bool segmentOpened;
             if (plsRecovery){
-              // Same split as the playlist site: finalize (classification logged), then
-              // open with the remaining cap budget threaded down as the PUT deadline.
-              Util::finalizePreviousUpload(myConn, newTarget);
+              // Same split as the playlist site: finalize (bounded by the remaining cap
+              // budget), then open with that budget threaded down as the PUT deadline.
+              Util::PutFinalizeResult segFin = Util::finalizePreviousUpload(myConn, newTarget, lastPlaylistConfirmMS + plsRecoveryCapMS);
+              if (segFin == Util::PUT_FIN_PERMANENT){
+                FAIL_MSG("Segment upload permanently rejected for `%s` - stopping push", newTarget.c_str());
+                Util::logExitReason(ER_WRITE_FAILURE, "segment upload permanently rejected (4xx): %s", newTarget.c_str());
+                plsConn.close();
+                onFinish();
+                break;
+              }
               segmentOpened = Util::openNextUpload(newTarget, myConn, false, lastPlaylistConfirmMS + plsRecoveryCapMS);
             }else{
               segmentOpened = Util::externalWriter(newTarget, myConn);
@@ -2271,6 +2297,15 @@ namespace Mist{
               // against the unconfirmed-write cap via lastSegmentOpenOk. The next segment
               // boundary re-attempts a real connection.
               lastSegmentOpenOk = false;
+              if (Util::bootMS() >= lastPlaylistConfirmMS + plsRecoveryCapMS){
+                FAIL_MSG("No confirmed playlist write for %" PRIu64 " ms - stopping push: %s",
+                         Util::bootMS() - lastPlaylistConfirmMS, playlistLocationString.c_str());
+                Util::logExitReason(ER_WRITE_FAILURE, "no confirmed playlist write within %" PRIu64 " ms: %s",
+                                    plsRecoveryCapMS, playlistLocationString.c_str());
+                plsConn.close();
+                onFinish();
+                break;
+              }
               int devNull = open("/dev/null", O_WRONLY);
               if (devNull < 0){
                 FAIL_MSG("Failed to open segment target and /dev/null fallback, aborting: %s", newTarget.c_str());
