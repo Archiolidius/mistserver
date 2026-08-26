@@ -1711,6 +1711,16 @@ namespace Mist{
           targetParams["m3u8"] = tmpParams["m3u8"];
         }
         if (tmpParams.count("segment")){
+          // A custom segment= template replaces the constructor's, including any
+          // MIST_HLS_UNIQUE_SEGMENTS session token it carried. Rewriting a
+          // caller-supplied template is out of scope by decision; unique naming
+          // is simply inactive for such targets, and saying so beats a silent
+          // false activation log from the constructor.
+          if (targetParams.count("ytHlsPush") && getenv("MIST_HLS_UNIQUE_SEGMENTS") &&
+              targetParams["segment"] != tmpParams["segment"]){
+            WARN_MSG("Custom segment= target replaces the session-token template: "
+                     "MIST_HLS_UNIQUE_SEGMENTS is inactive for this target");
+          }
           targetParams["segment"] = tmpParams["segment"];
         }
       }

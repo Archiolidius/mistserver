@@ -1030,6 +1030,10 @@ void Socket::Connection::resetCounter(){
   sessionStart = 0;
 }
 
+void Socket::Connection::setLifetimeTotals(bool track){
+  lifetimeTotals = track;
+}
+
 void Socket::Connection::addUp(const uint32_t i){
   up += i;
 }
@@ -1070,18 +1074,25 @@ void Socket::Connection::close(){
 /// This function does *not* call shutdown, allowing continued use in other
 /// processes.
 void Socket::Connection::drop(){
-  // Fold the ending connection's counters into the object-lifetime accumulators
-  // BEFORE anything clears them, so dataUp()/dataDown() stay cumulative and
-  // monotonic across reconnects (including ones performed inside callees, e.g.
-  // Downloader retry loops) and connTime() keeps reporting the first connect.
-  // resetCounter() is the one deliberate full reset. The generation bump makes
-  // any close-and-reopen detectable by exact match; spurious bumps from
+  // With lifetime totals enabled (persistent uploads only), fold the ending
+  // connection's counters into the object-lifetime accumulators BEFORE anything
+  // clears them, so dataUp()/dataDown() stay cumulative and monotonic across
+  // reconnects (including ones performed inside callees, e.g. Downloader retry
+  // loops) and connTime() keeps reporting the first connect. Guarded on the
+  // socket having actually been open: open() itself starts with drop(), and an
+  // unguarded capture would record a placeholder object's construction time as
+  // its connect time. Off (the default) leaves every reader byte-identical to
+  // the historical behavior. resetCounter() is the one deliberate full reset.
+  // The generation bump is unconditional: it has no reader-visible semantics,
+  // and reuse identity must work before any opt-in. Spurious bumps from
   // dropping an already-closed connection are harmless (only equality is used).
-  lifeUp += up;
-  lifeDown += down;
-  up = 0;
-  down = 0;
-  if (!sessionStart){sessionStart = conntime;}
+  if (lifetimeTotals && (sSend != -1 || sRecv != -1)){
+    lifeUp += up;
+    lifeDown += down;
+    up = 0;
+    down = 0;
+    if (!sessionStart){sessionStart = conntime;}
+  }
   ++generation;
   upBuffer.clear();
 #ifdef SSL
@@ -1570,20 +1581,23 @@ bool Socket::Connection::connected() const{
 }
 
 /// Returns the time this socket has been connected.
-/// Reports the FIRST connect of this object once any reconnect happened, so
-/// elapsed-time consumers (now - connTime()) never see time move backwards.
+/// With lifetime totals enabled, reports the FIRST connect of this object once
+/// any reconnect happened, so elapsed-time consumers (now - connTime()) never
+/// see time move backwards. Historical per-connection value otherwise.
 unsigned int Socket::Connection::connTime(){
-  return sessionStart ? sessionStart : conntime;
+  return (lifetimeTotals && sessionStart) ? sessionStart : conntime;
 }
 
-/// Returns total amount of bytes sent (cumulative across reconnects of this object).
+/// Returns total amount of bytes sent (cumulative across reconnects when
+/// lifetime totals are enabled; historical per-connection value otherwise).
 uint64_t Socket::Connection::dataUp(){
-  return lifeUp + up;
+  return lifetimeTotals ? lifeUp + up : up;
 }
 
-/// Returns total amount of bytes received (cumulative across reconnects of this object).
+/// Returns total amount of bytes received (cumulative across reconnects when
+/// lifetime totals are enabled; historical per-connection value otherwise).
 uint64_t Socket::Connection::dataDown(){
-  return lifeDown + down;
+  return lifetimeTotals ? lifeDown + down : down;
 }
 
 /// Reconnect generation: bumped on every drop(). Reuse logic records the value

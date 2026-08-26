@@ -157,6 +157,7 @@ namespace Socket{
     uint64_t lifeDown = 0;          ///< Bytes received on prior connections of this object
     long long int sessionStart = 0; ///< First connect time, preserved across reconnects
     uint64_t generation = 0;        ///< Bumped on every drop; never reset
+    bool lifetimeTotals = false;    ///< Opt-in (persistent uploads): readers report cumulative values
     Buffer downbuffer; ///< Stores received data (both in blocking and non-blocking modes)
     Buffer upBuffer; ///< In non-blocking mode, buffers outgoing writes
     int iread(void *buffer, int len, int flags = 0);  ///< Incremental read call.
@@ -242,6 +243,11 @@ namespace Socket{
     uint64_t dataDown();     ///< Returns total amount of bytes received.
     void resetCounter();     ///< Resets the up/down bytes counter to zero.
     uint64_t getGeneration() const; ///< Reconnect generation; exact match = same live connection.
+    /// Opt-in cumulative statistics for objects that reconnect deliberately
+    /// (persistent uploads): dataUp()/dataDown()/connTime() then report values
+    /// folded across reconnects, staying monotonic for stats consumers. Off (the
+    /// default) keeps the historical per-connection reader semantics everywhere.
+    void setLifetimeTotals(bool track);
     void addUp(const uint32_t i);
     void addDown(const uint32_t i);
     friend class Server;

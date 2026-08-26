@@ -39,7 +39,12 @@ namespace {
     KEEP_200_CHUNKED, ///< 200 with a chunked (zero-chunk) final response, kept open
     KEEP_200_CLOSEHDR,///< 200 with "Connection: close", then actually close
     KEEP_200_DUPCL,   ///< 200 with two Content-Length headers (case variants), kept open
-    KEEP_200_THEN_DROP///< 200 kept open, then the server closes it (idle-close)
+    KEEP_200_THEN_DROP,///< 200 kept open, then the server closes it (idle-close)
+    KEEP_204,          ///< 204 No Content (no body headers at all), kept open
+    KEEP_200_CLOSEDELIM,///< 200 with no framing headers, delimited by close
+    KEEP_200_BADCL,    ///< 200 with "Content-Length: 0x" (trailing garbage), kept open
+    KEEP_200_BIGCL,    ///< 200 with an oversized Content-Length, kept open
+    KEEP_200_EMPTYTE   ///< 200 with an EMPTY Transfer-Encoding header + CL: 0, kept open
   };
 
   std::condition_variable cv;
@@ -146,6 +151,11 @@ namespace {
         case KEEP_200_CLOSEHDR: C.SendNow("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"); keepConn = false; break;
         case KEEP_200_DUPCL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n"); break;
         case KEEP_200_THEN_DROP: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); Util::sleep(50); keepConn = false; break;
+        case KEEP_204: C.SendNow("HTTP/1.1 204 No Content\r\n\r\n"); break;
+        case KEEP_200_CLOSEDELIM: C.SendNow("HTTP/1.1 200 OK\r\n\r\n"); Util::sleep(50); keepConn = false; break;
+        case KEEP_200_BADCL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0x\r\n\r\n"); break;
+        case KEEP_200_BIGCL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999\r\n\r\n"); break;
+        case KEEP_200_EMPTYTE: C.SendNow("HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\nContent-Length: 0\r\n\r\n"); break;
         default: break; // ACCEPT_THEN_QUIET answers nothing
         }
         if (behavior == ACCEPT_THEN_QUIET){
@@ -229,8 +239,8 @@ namespace {
   /// the output.cpp cycle: finalize the previous upload, open the next, send a
   /// small body. finResult is the finalize classification of the PREVIOUS upload.
   bool uploadCycle(const std::string &url, Socket::Connection &conn, Util::PersistentUploader &pu,
-                   Util::PutFinalizeResult &finResult){
-    finResult = Util::finalizePreviousUpload(conn, url, 0, &pu);
+                   Util::PutFinalizeResult &finResult, uint64_t finDeadlineMS = 0){
+    finResult = Util::finalizePreviousUpload(conn, url, finDeadlineMS, &pu);
     if (!Util::openNextUpload(url, conn, false, 0, false, &pu)){return false;}
     conn.SendNow("hello", 5);
     return true;
@@ -411,6 +421,90 @@ int main(int argc, char **argv){
       conn.close();
       if (acceptCount != 2){ok = fail("duplicate Content-Length must forbid reuse, server saw " + std::to_string(acceptCount) + " accepts");}
     }
+  }else if (testCase == "persist204"){
+    // A 204 final response is length-delimited by definition: reusable.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_204, KEEP_204}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+      else if (i && r != Util::PUT_FIN_OK_2XX){ok = fail(std::string("204 classified as ") + finName(r));}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 1){ok = fail("204 must be reusable, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistclosedelim"){
+    // A close-delimited response (no framing headers) is complete only when the
+    // peer closes: by definition not reusable.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_CLOSEDELIM, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("close-delimited must not be reused, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistbadcl"){
+    // "Content-Length: 0x": atoi would read 0, the exact-string rule must refuse.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_BADCL, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("trailing-garbage Content-Length must not be reused, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistbigcl"){
+    // An oversized Content-Length never completes parsing: bounded finalize
+    // reports no response, and the connection must not be reused.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_BIGCL, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    if (!uploadCycle(url, conn, pu, r)){ok = fail("first upload could not open");}
+    if (ok && !uploadCycle(url, conn, pu, r, Util::bootMS() + 1200)){ok = fail("second upload could not open");}
+    if (ok && r == Util::PUT_FIN_OK_2XX){ok = fail("oversized Content-Length classified as a completed 2xx");}
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, Util::bootMS() + 1200, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("oversized Content-Length must not be reused, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistemptyte"){
+    // An EMPTY Transfer-Encoding header is still a Transfer-Encoding header:
+    // presence disqualifies (hasHeader, not value).
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_EMPTYTE, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("empty Transfer-Encoding header must not be reused, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
   }else if (testCase == "persistidle"){
     // The server idle-closes a reusable connection between cycles: the next
     // upload must transparently reconnect and still deliver (no stuck state).
@@ -422,8 +516,13 @@ int main(int argc, char **argv){
     Util::PutFinalizeResult r;
     if (!uploadCycle(url, conn, pu, r)){ok = fail("first upload could not open");}
     if (ok){
-      // Give the server time to close the kept connection before the next cycle.
-      Util::sleep(300);
+      // Wait until the peer's close is actually visible on our side (bounded),
+      // rather than a fixed sleep that can race a loaded machine.
+      uint64_t waitEnd = Util::bootMS() + 3000;
+      while (conn && Util::bootMS() < waitEnd){
+        conn.spool();
+        Util::sleep(20);
+      }
       if (!uploadCycle(url, conn, pu, r)){ok = fail("post-idle-close upload could not open");}
       else if (r != Util::PUT_FIN_OK_2XX){ok = fail(std::string("first 200 classified as ") + finName(r));}
     }
@@ -466,16 +565,28 @@ int main(int argc, char **argv){
     // reconnects of one object (stats consumers treat decreases as errors),
     // connTime() must keep reporting the first connect, and resetCounter()
     // must still zero everything.
+    // drop() closes the previous descriptor, so every reopen needs a fresh fd.
     int fd1 = open("/dev/null", O_WRONLY);
     int fd2 = open("/dev/null", O_WRONLY);
-    if (fd1 < 0 || fd2 < 0){ok = fail("could not open /dev/null");}
+    int fd3 = open("/dev/null", O_WRONLY);
+    int fd4 = open("/dev/null", O_WRONLY);
+    if (fd1 < 0 || fd2 < 0 || fd3 < 0 || fd4 < 0){ok = fail("could not open /dev/null");}
     else{
-      Socket::Connection c(fd1, fd1);
+      // Default (no opt-in): historical semantics must be byte-identical -
+      // counters reset on reopen, exactly as before this change.
+      Socket::Connection legacyC(fd1, fd1);
+      legacyC.SendNow("0123456789", 10);
+      legacyC.open(fd2, fd2);
+      if (legacyC.dataUp() != 0){ok = fail("legacy semantics changed: dataUp kept bytes without opt-in");}
+      legacyC.close();
+      // Opt-in: cumulative and monotonic across reconnects.
+      Socket::Connection c(fd3, fd3);
+      c.setLifetimeTotals(true);
       c.SendNow("0123456789", 10);
       uint64_t upFirst = c.dataUp();
       unsigned int t0 = c.connTime();
       uint64_t genFirst = c.getGeneration();
-      c.open(fd2, fd2); // reconnect: legacy counters would reset here
+      c.open(fd4, fd4); // reconnect: legacy counters would reset here
       if (c.getGeneration() == genFirst){ok = fail("generation did not change on reopen");}
       c.SendNow("0123456789", 10);
       if (ok && c.dataUp() < upFirst + 10){

@@ -615,9 +615,23 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           body.clear();
           knownLength = false;
           if (GetHeader("Content-Length") != ""){
-            length = atoi(GetHeader("Content-Length").c_str());
-            if (!bodyCallback && !onData && body.capacity() < length) { body.reserve(length); }
-            knownLength = true;
+            // strtoull with full-string validation, not atoi: atoi overflow on an
+            // oversized value is undefined and, fed into body.reserve(), threw an
+            // uncaught length_error - a remote peer could kill any Mist HTTP
+            // client with a single oversized Content-Length header. Unparseable
+            // or absurd values now fall back to close-delimited reading instead.
+            const std::string &clVal = GetHeader("Content-Length");
+            char *clEnd = 0;
+            unsigned long long clParsed = strtoull(clVal.c_str(), &clEnd, 10);
+            if (clEnd && !*clEnd && clVal.size() && clParsed <= 0xFFFFFFFFull){
+              length = clParsed;
+              // reserve() is an optimization only: cap it so a large (but valid)
+              // length cannot force a huge upfront allocation either.
+              if (!bodyCallback && !onData && body.capacity() < length && length <= (16ull << 20)){
+                body.reserve(length);
+              }
+              knownLength = true;
+            }
           }
           if (GetHeader("Transfer-Encoding") == "chunked"){
             getChunks = true;

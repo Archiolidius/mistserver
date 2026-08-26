@@ -443,15 +443,21 @@ namespace Util{
         Util::stringToLower(connHdr);
         bool closeRequested = connHdr.find("close") != std::string::npos;
         bool lengthDelimited = false;
-        if (!response.GetHeader("Transfer-Encoding").size()) {
+        // hasHeader, not the value: an empty "Transfer-Encoding:" header is still
+        // a Transfer-Encoding header and must disqualify (fail closed).
+        if (!response.hasHeader("Transfer-Encoding")) {
           const std::string &cl = response.GetHeader("Content-Length");
           if (response.url.size() >= 3 && response.url.substr(0, 3) == "204") {
             lengthDelimited = true;
-          } else if (cl.size() && cl.size() <= 18) {
+          } else if (cl == "0") {
+            // Maximally fail-closed: only an explicit zero-length body qualifies.
+            // A nonzero Content-Length would rely on the shared parser's atoi
+            // (overflow-prone) having consumed the body exactly; refusing reuse
+            // there costs nothing - YouTube's ingest answers Content-Length: 0
+            // (measured 2026-08-26) - and removes the whole class of
+            // wrong-boundary reuse. Trailing garbage ("0x") fails the exact
+            // string compare by construction.
             lengthDelimited = true;
-            for (size_t ci = 0; ci < cl.size(); ++ci) {
-              if (cl[ci] < '0' || cl[ci] > '9') { lengthDelimited = false; break; }
-            }
           }
         }
         if (lengthDelimited && !closeRequested) {
@@ -548,6 +554,12 @@ namespace Util{
       // Downloader (the non-persistent path) has empty state, so prepareRequest
       // reconnects - exactly the legacy behavior.
       HTTP::Downloader &dl = persist ? uploader->downloader() : localDl;
+      if (persist) {
+        // Cumulative statistics across our deliberate reconnects (opt-in so that
+        // with the gate off every Connection reader stays byte-identical to the
+        // historical behavior for all other outputs).
+        conn.setLifetimeTotals(true);
+      }
       if (persist && conn &&
           !(uploader->reusable && conn.getGeneration() == uploader->lastGeneration)) {
         // Not eligible for reuse: force a fresh connection. Without this,

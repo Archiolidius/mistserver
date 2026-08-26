@@ -31,6 +31,11 @@ test('persistent: chunked response never reused', downloaderputtest, args: ['per
 test('persistent: Connection close never reused', downloaderputtest, args: ['persistclose'], suite: 'Downloader PUT')
 test('persistent: duplicate Content-Length never reused', downloaderputtest, args: ['persistdupcl'], suite: 'Downloader PUT')
 test('persistent: idle-close reconnects transparently', downloaderputtest, args: ['persistidle'], suite: 'Downloader PUT')
+test('persistent: 204 is reusable', downloaderputtest, args: ['persist204'], suite: 'Downloader PUT')
+test('persistent: close-delimited never reused', downloaderputtest, args: ['persistclosedelim'], suite: 'Downloader PUT')
+test('persistent: garbage Content-Length never reused', downloaderputtest, args: ['persistbadcl'], suite: 'Downloader PUT')
+test('persistent: oversized Content-Length never reused', downloaderputtest, args: ['persistbigcl'], suite: 'Downloader PUT')
+test('persistent: empty Transfer-Encoding never reused', downloaderputtest, args: ['persistemptyte'], suite: 'Downloader PUT')
 test('persistent: descriptor swap forces reconnect', downloaderputtest, args: ['persistswap'], suite: 'Downloader PUT')
 test('socket counters cumulative and monotonic', downloaderputtest, args: ['statsmono'], suite: 'Downloader PUT')
 
