@@ -8,7 +8,9 @@
 #include <mist/ts_stream.h>
 #include <mist/url.h>
 
+#include <cstdlib>
 #include <dirent.h>
+#include <string>
 #include <unistd.h>
 
 namespace Mist{
@@ -22,8 +24,20 @@ namespace Mist{
       targetParams["m3u8"] = target.path + "?" + target.args + "index.m3u8";
       targetParams["split"] = "1";
       targetParams["maxEntries"] = "3";
+      // Announced-window depth override. YouTube's HLS ingest spec allows up to 5
+      // outstanding segments; a deeper window makes short upstream stalls survivable
+      // for the player. Unset or out-of-range values keep the legacy depth of 3.
+      if (const char *envEntries = getenv("MIST_HLS_MAX_ENTRIES")) {
+        int entries = atoi(envEntries);
+        if (entries >= 3 && entries <= 5) {
+          targetParams["maxEntries"] = std::to_string(entries);
+        } else {
+          WARN_MSG("Ignoring MIST_HLS_MAX_ENTRIES='%s' (allowed range 3-5)", envEntries);
+        }
+      }
       targetParams["nounlink"] = "";
-      INFO_MSG("Youtube-style HLS push -> setting appropriate segmenting options");
+      INFO_MSG("Youtube-style HLS push -> setting appropriate segmenting options (window depth %s)",
+               targetParams["maxEntries"].c_str());
     }
     if (target.protocol == "srt"){
       std::string newTarget = "ts-exec:srt-live-transmit file://con " + target.getUrl();
