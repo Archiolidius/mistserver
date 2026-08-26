@@ -1266,6 +1266,42 @@ Socket::Connection::Connection(std::string host, int port, bool nonblock, bool w
 
 /// Open TCP connection.
 /// Closes any existing connections and resets all internal values beforehand.
+#ifdef SSL
+/// Frees the SSL context objects allocated by open() when a secure connection attempt
+/// fails before the handshake completed, closing the underlying fd (held inside the
+/// mbedtls net context after the handoff) as a side effect. drop() only performs this
+/// cleanup once sslConnected is set, so without this call every failed handshake leaks
+/// the fd and all five mbedtls objects. Used by the deadline-bounded connect path.
+void Socket::Connection::sslPreConnectCleanup(){
+  if (sslConnected){return;}
+  if (server_fd){
+    mbedtls_net_free(server_fd);
+    delete server_fd;
+    server_fd = 0;
+  }
+  if (ssl){
+    mbedtls_ssl_free(ssl);
+    delete ssl;
+    ssl = 0;
+  }
+  if (conf){
+    mbedtls_ssl_config_free(conf);
+    delete conf;
+    conf = 0;
+  }
+  if (ctr_drbg){
+    mbedtls_ctr_drbg_free(ctr_drbg);
+    delete ctr_drbg;
+    ctr_drbg = 0;
+  }
+  if (entropy){
+    mbedtls_entropy_free(entropy);
+    delete entropy;
+    entropy = 0;
+  }
+}
+#endif
+
 /// Open TCP connection. When deadlineMS is nonzero it is an absolute Util::bootMS()
 /// deadline that bounds the TCP connect attempts and the TLS handshake; DNS resolution
 /// is a documented overshoot. deadlineMS == 0 keeps the legacy behavior byte-for-byte.
@@ -1318,6 +1354,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
   for (rp = result; rp; rp = rp->ai_next){
     if (deadlineMS && Util::bootMS() >= deadlineMS){
       lastErr += "connect deadline expired";
+      rp = 0; // take the connection-failed path below; never treat a closed fd as connected
       break;
     }
     sSend = socket(rp->ai_family, SOCK_STREAM, rp->ai_protocol);
@@ -1341,6 +1378,15 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
       struct timeval timeout;
       timeout.tv_sec = 1;
       timeout.tv_usec = 0;
+      if (deadlineMS){
+        // Clamp the select tick to the remaining budget so a connect attempt cannot
+        // overshoot the deadline by up to a second.
+        uint64_t remainMS = deadlineMS - Util::bootMS();
+        if (remainMS < 1000){
+          timeout.tv_sec = 0;
+          timeout.tv_usec = remainMS * 1000;
+        }
+      }
       fd_set wList, eList;
       FD_ZERO(&wList);
       FD_ZERO(&eList);
@@ -1376,6 +1422,9 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
 
   if (rp == 0){
     FAIL_MSG("Could not connect to %s! Error: %s", host.c_str(), lastErr.c_str());
+#ifdef SSL
+    if (deadlineMS && with_ssl){sslPreConnectCleanup();}
+#endif
     close();
     return;
   }
@@ -1433,6 +1482,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
           mbedtls_strerror(ret, estr, 200);
           lastErr = estr;
           FAIL_MSG("SSL handshake error %d: %s", ret, lastErr.c_str());
+          sslPreConnectCleanup();
           close();
           return;
         }
@@ -1440,6 +1490,7 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
         if (nowMS >= deadlineMS){
           lastErr = "TLS handshake deadline expired";
           FAIL_MSG("SSL handshake error: deadline expired connecting to %s", host.c_str());
+          sslPreConnectCleanup();
           close();
           return;
         }
@@ -1628,6 +1679,9 @@ unsigned int Socket::Connection::iwrite(const void *buffer, int len){
     int r;
     r = mbedtls_ssl_write(ssl, (const unsigned char *)buffer, len);
     if (r < 0){
+      // mbedtls signals want-read/want-write in the return value, not in errno; on a
+      // nonblocking socket a partial TLS record must be retried, not treated as fatal.
+      if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE){return 0;}
       switch (errno){
       case MBEDTLS_ERR_SSL_WANT_WRITE: return 0; break;
       case MBEDTLS_ERR_SSL_WANT_READ: return 0; break;
@@ -1705,6 +1759,13 @@ int Socket::Connection::iread(void *buffer, int len, int flags){
     /// \TODO Flags ignored... Bad.
     r = mbedtls_ssl_read(ssl, (unsigned char *)buffer, len);
     if (r < 0){
+      // mbedtls signals want-read/want-write and peer-close in the return value, not
+      // in errno; on a nonblocking socket a partial TLS record must be retried.
+      if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE){return 0;}
+      if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY){
+        close();
+        return 0;
+      }
       switch (errno){
       case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
         close();

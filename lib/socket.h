@@ -191,6 +191,7 @@ namespace Socket{
     void open(int write, int read);                      // Open from two existing file descriptors.
 #ifdef SSL
     bool sslAccept(mbedtls_ssl_config * sslConf, mbedtls_ctr_drbg_context * dbgCtx);
+    void sslPreConnectCleanup(); ///< Frees SSL contexts after a failed connect/handshake (drop() only cleans up once sslConnected is set).
 #endif
     void close();                                        ///< Close connection.
     void drop();                                         ///< Close connection without shutdown.
