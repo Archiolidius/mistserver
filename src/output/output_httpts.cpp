@@ -36,6 +36,9 @@ namespace Mist{
         }
       }
       targetParams["nounlink"] = "";
+      // Marks this target as a YouTube-style HLS push so the segmenting loop can scope
+      // its playlist-recovery behavior to exactly this mode (see MIST_PLAYLIST_RECOVERY).
+      targetParams["ytHlsPush"] = "1";
       INFO_MSG("Youtube-style HLS push -> setting appropriate segmenting options (window depth %s)",
                targetParams["maxEntries"].c_str());
     }

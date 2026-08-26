@@ -289,45 +289,64 @@ namespace Util{
     }
   }
 
+  /// \brief Finalizes the previous chunked upload on the given connection, if any.
+  /// Sends the final zero chunk, waits up to 5 s for the server's final response,
+  /// classifies it, and closes the connection. Timing and logging are identical to the
+  /// historical externalWriter behavior; the classification is returned instead of
+  /// being discarded.
+  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint) {
+    if (!conn || !conn.isChunkedMode()) { return PUT_FIN_NONE; }
+    uint64_t finalizeStart = Util::bootMS();
+    conn.SendNow(0, 0);
+    HTTP::Parser response;
+    bool gotResponse = false;
+    PutFinalizeResult result = PUT_FIN_NO_RESPONSE;
+    Event::Loop ev;
+    auto attemptFinish = [&]() {
+      if (response.Read(conn)) {
+        uint64_t finalizeMs = Util::bootMS() - finalizeStart;
+        // Record the final status of every completed upload (observability only; callers decide what to do)
+        if (response.url.size() && response.url[0] == '2') {
+          INFO_MSG("Server response to upload (before %s): %s %s (confirmed 2xx after %" PRIu64 " ms)",
+                   uriHint.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
+          result = PUT_FIN_OK_2XX;
+        } else {
+          WARN_MSG("Non-2xx server response to upload (before %s): %s %s (after %" PRIu64 " ms)",
+                   uriHint.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
+          result = (response.url.size() && response.url[0] == '5') ? PUT_FIN_TRANSIENT : PUT_FIN_PERMANENT;
+        }
+        gotResponse = true;
+      }
+    };
+    conn.setBlocking(false);
+    ev.addSocket(conn.getSocket(), [&](void *) {
+      while (conn.spool()) { attemptFinish(); }
+    }, 0);
+    uint64_t maxWait = Util::bootMS() + 5000;
+    attemptFinish();
+    while (!gotResponse && Util::bootMS() < maxWait) { ev.await(1000); }
+    if (!gotResponse) {
+      WARN_MSG("No reply from remote server to PUT request (%s, waited %" PRIu64 " ms)",
+               conn ? "connection still open" : "connection lost", (uint64_t)(Util::bootMS() - finalizeStart));
+      if (!conn) { result = PUT_FIN_TRANSIENT; }
+    }
+    conn.close();
+    return result;
+  }
+
   /// \brief Connects the given file descriptor to a file or uploader binary
   /// \param uri target URL or filepath
   /// \param outFile file descriptor which will be used to send data
   /// \param append whether to open this connection in truncate or append mode
   bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append) {
-    // Send final chunk if in chunked mode
-    if (conn && conn.isChunkedMode()) {
-      uint64_t finalizeStart = Util::bootMS();
-      conn.SendNow(0, 0);
-      HTTP::Parser response;
-      bool gotResponse = false;
-      Event::Loop ev;
-      auto attemptFinish = [&]() {
-        if (response.Read(conn)) {
-          uint64_t finalizeMs = Util::bootMS() - finalizeStart;
-          // Record the final status of every completed upload (observability only; nothing acts on it here)
-          if (response.url.size() && response.url[0] == '2') {
-            INFO_MSG("Server response to upload (before %s): %s %s (confirmed 2xx after %" PRIu64 " ms)",
-                     uri.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
-          } else {
-            WARN_MSG("Non-2xx server response to upload (before %s): %s %s (after %" PRIu64 " ms)",
-                     uri.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
-          }
-          gotResponse = true;
-        }
-      };
-      conn.setBlocking(false);
-      ev.addSocket(conn.getSocket(), [&](void *) {
-        while (conn.spool()) { attemptFinish(); }
-      }, 0);
-      uint64_t maxWait = Util::bootMS() + 5000;
-      attemptFinish();
-      while (!gotResponse && Util::bootMS() < maxWait) { ev.await(1000); }
-      if (!gotResponse) {
-        WARN_MSG("No reply from remote server to PUT request (%s, waited %" PRIu64 " ms)",
-                 conn ? "connection still open" : "connection lost", (uint64_t)(Util::bootMS() - finalizeStart));
-      }
-      conn.close();
-    }
+    // Send final chunk if in chunked mode (historical behavior: result ignored)
+    finalizePreviousUpload(conn, uri);
+    return openNextUpload(uri, conn, append);
+  }
+
+  /// \brief The "open" half of externalWriter: connects the given connection to a file
+  /// or uploader binary without touching any previous upload state on it.
+  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append, uint64_t deadlineMS) {
     HTTP::URL target = HTTP::localURIResolver().link(uri);
 
     // Local paths just write to file
@@ -403,6 +422,8 @@ namespace Util{
         if (putBudgetMS) { INFO_MSG("PUT deadline mode active: %" PRId64 " ms budget per upload", putBudgetMS); }
       }
       uint64_t putDeadline = putBudgetMS ? Util::bootMS() + putBudgetMS : 0;
+      // A caller-provided deadline can only tighten the budget, never extend it.
+      if (deadlineMS && (!putDeadline || deadlineMS < putDeadline)) { putDeadline = deadlineMS; }
       if (!dl.startPut(target, conn, 6, putDeadline)) { return false; }
       return true;
     }

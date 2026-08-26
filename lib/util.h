@@ -22,6 +22,18 @@ namespace Util{
   void stringTrim(std::string &val);
   void splitString(const std::string & val, char delim, std::deque<std::string> & result);
   void shellSplit(const std::string & val, std::deque<std::string> & result);
+  /// Result of finalizing the previous chunked upload on a connection.
+  enum PutFinalizeResult{
+    PUT_FIN_NONE = 0,   ///< Nothing to finalize (connection not open or not in chunked mode)
+    PUT_FIN_OK_2XX,     ///< Final response received with a 2xx status
+    PUT_FIN_TRANSIENT,  ///< 5xx final status, or connection lost while waiting
+    PUT_FIN_PERMANENT,  ///< Non-2xx, non-5xx final status (e.g. 403/404)
+    PUT_FIN_NO_RESPONSE ///< Connection stayed open but no final response arrived in time
+  };
+  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint = "");
+  /// deadlineMS: optional absolute Util::bootMS() deadline for HTTP(S) targets; the
+  /// effective PUT deadline is the earlier of this and the MIST_PUT_DEADLINE_MS budget.
+  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append = false, uint64_t deadlineMS = 0);
   bool externalWriter(const std::string & file, Socket::Connection & conn, bool append = false);
 
   int64_t expBackoffMs(const size_t currIter, const size_t maxIter, const int64_t maxWait);
