@@ -7,8 +7,11 @@
 #include <mist/ts_packet.h>
 #include <mist/ts_stream.h>
 #include <mist/url.h>
+#include <mist/util.h>
 
 #include <cstdlib>
+#include <cstring>
+#include <strings.h>
 #include <dirent.h>
 #include <string>
 #include <unistd.h>
@@ -20,7 +23,34 @@ namespace Mist{
     HTTP::URL target(config->getString("target"));
     // Detect youtube-style URL
     if (target.path == "http_upload_hls" && target.args.size() >= 5 && target.args.find("file=") == target.args.size() - 5) {
-      targetParams["segment"] = target.path + "?" + target.args + "$segmentCounter.ts";
+      // MIST_HLS_UNIQUE_SEGMENTS: prefix segment filenames with a per-process
+      // random token so names never repeat across pusher restarts or encoder
+      // reboots (YouTube HLS ingest: filenames "must be unique across encoder
+      // reboots and stream restarts"). Off (the default) keeps the legacy bare
+      // counter names. The sequence numbering itself is untouched either way -
+      // a restart still begins EXT-X-MEDIA-SEQUENCE at 0; continuity across
+      // restarts is a separate, deliberately deferred change.
+      std::string segPrefix;
+      if (const char *envUniq = getenv("MIST_HLS_UNIQUE_SEGMENTS")) {
+        if (!strcmp(envUniq, "1") || !strcasecmp(envUniq, "true")) {
+          // 12 bytes = 96 bits: collision-proof across reboots, restored
+          // images, and concurrent starts. Hex stays inside YouTube's
+          // permitted filename charset.
+          segPrefix = Util::secureRandomHex(12);
+          if (segPrefix.size()) {
+            segPrefix += "_";
+            INFO_MSG("Unique segment naming active (session token %s)", segPrefix.c_str());
+          } else {
+            // Fail closed: emitting predictable names while claiming unique
+            // naming would silently void the guarantee this switch exists for.
+            onFail("MIST_HLS_UNIQUE_SEGMENTS is set but no secure random source is available", true);
+            return;
+          }
+        } else if (*envUniq && strcmp(envUniq, "0") && strcasecmp(envUniq, "false")) {
+          WARN_MSG("Ignoring MIST_HLS_UNIQUE_SEGMENTS='%s' (use 1/true to enable)", envUniq);
+        }
+      }
+      targetParams["segment"] = target.path + "?" + target.args + segPrefix + "$segmentCounter.ts";
       targetParams["m3u8"] = target.path + "?" + target.args + "index.m3u8";
       targetParams["split"] = "1";
       targetParams["maxEntries"] = "3";

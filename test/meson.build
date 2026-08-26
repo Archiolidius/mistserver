@@ -24,6 +24,10 @@ test('5xx at open retries in place', downloaderputtest, args: ['deny500retry'], 
 test('4xx at open fails immediately', downloaderputtest, args: ['deny403'], suite: 'Downloader PUT')
 test('silent server cannot hang the pusher', downloaderputtest, args: ['deadline'], suite: 'Downloader PUT')
 
+# Session-token source for MIST_HLS_UNIQUE_SEGMENTS (unique segment naming).
+securerandomtest = executable('securerandomtest', 'secure_random.cpp', header_tgts, dependencies: libmist_dep)
+test('secure random hex: length, charset, distinctness', securerandomtest, suite: 'Secure random')
+
 
 # The only argument is simply the 'alg' parameter value as defined in the JWA spec (RFC7518)
 jwttest = executable('jwttest', 'jwt.cpp', header_tgts, dependencies: libmist_dep)

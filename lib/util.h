@@ -41,6 +41,7 @@ namespace Util{
   int64_t expBackoffMs(const size_t currIter, const size_t maxIter, const int64_t maxWait);
 
   void getRandomBytes(void * dest, size_t len);
+  std::string secureRandomHex(size_t bytes);
   std::string getRandomAlphanumeric(size_t len);
   std::string generateUUID();
 

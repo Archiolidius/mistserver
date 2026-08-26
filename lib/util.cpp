@@ -504,6 +504,27 @@ namespace Util{
     rndSrc.close();
   }
 
+  /// Lowercase hex string of `bytes` bytes read from /dev/urandom.
+  /// Unlike getRandomBytes there is deliberately NO rand() fallback: callers use
+  /// this for uniqueness guarantees (MIST_HLS_UNIQUE_SEGMENTS session tokens),
+  /// where a weak token would silently void the guarantee. Returns the empty
+  /// string when the secure source cannot supply all requested bytes - callers
+  /// must fail closed on that.
+  std::string secureRandomHex(size_t bytes){
+    std::string raw(bytes, '\0');
+    std::ifstream rndSrc("/dev/urandom", std::ifstream::binary);
+    rndSrc.read(&raw[0], bytes);
+    if (!rndSrc.good() || (size_t)rndSrc.gcount() != bytes){return "";}
+    rndSrc.close();
+    static const char hexDigits[] = "0123456789abcdef";
+    std::string ret(bytes * 2, '0');
+    for (size_t i = 0; i < bytes; ++i){
+      ret[i * 2] = hexDigits[(raw[i] >> 4) & 0xF];
+      ret[i * 2 + 1] = hexDigits[raw[i] & 0xF];
+    }
+    return ret;
+  }
+
   /// Secure random alphanumeric string generator
   /// Uses getRandomBytes internally
   std::string getRandomAlphanumeric(size_t len){
