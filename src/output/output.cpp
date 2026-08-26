@@ -2254,11 +2254,17 @@ namespace Mist{
                     lastPlaylistConfirmMS = Util::bootMS();
                     capDeadline = lastPlaylistConfirmMS + plsRecoveryCapMS;
                   }
+                  // A 4xx is logged but never tears the push down on its own. YouTube
+                  // answers 400 to the first playlist PUT of a stream (it is written
+                  // before any segment exists) and then accepts everything that follows;
+                  // the previous code discarded every final status, so that was invisible
+                  // and harmless. Treating a 4xx as fatal killed a working stream every
+                  // few seconds. The cap below is the only teardown authority: an endpoint
+                  // that really is rejecting us never confirms a write, so it still exits
+                  // within plsRecoveryCapMS.
                   if (fin == Util::PUT_FIN_PERMANENT){
-                    FAIL_MSG("Playlist upload permanently rejected for `%s` - stopping push", playlistLocationString.c_str());
-                    Util::logExitReason(ER_WRITE_FAILURE, "playlist upload permanently rejected (4xx): %s", playlistLocationString.c_str());
-                    plsConn.close();
-                    break;
+                    WARN_MSG("Playlist upload rejected (4xx) for `%s` - not counted as delivered; "
+                             "the unconfirmed-write cap governs teardown", playlistLocationString.c_str());
                   }
                   // The remaining cap budget is threaded down as the PUT deadline, so a
                   // single open attempt can never overshoot the cap.
@@ -2319,12 +2325,11 @@ namespace Mist{
               // and never reach the cap.
               prevCycleSegmentSentOk = prevCycleSegmentOpenOk &&
                                        (segFin == Util::PUT_FIN_OK_2XX || segFin == Util::PUT_FIN_NO_RESPONSE);
+              // As at the playlist site: a 4xx is logged, never fatal by itself. It
+              // already fails to count as delivered above, so a genuinely rejecting
+              // endpoint still reaches the cap.
               if (segFin == Util::PUT_FIN_PERMANENT){
-                FAIL_MSG("Segment upload permanently rejected for `%s` - stopping push", newTarget.c_str());
-                Util::logExitReason(ER_WRITE_FAILURE, "segment upload permanently rejected (4xx): %s", newTarget.c_str());
-                plsConn.close();
-                onFinish();
-                break;
+                WARN_MSG("Segment upload rejected (4xx) for `%s` - not counted as delivered", newTarget.c_str());
               }
               segmentOpened = Util::openNextUpload(newTarget, myConn, false, lastPlaylistConfirmMS + plsRecoveryCapMS);
             }else{
