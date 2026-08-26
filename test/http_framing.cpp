@@ -38,6 +38,13 @@ int main(int argc, char **argv){
     expect(P.hasFramingError(), "'+1' Content-Length flags a framing error");
   }
   {
+    // An EMPTY Content-Length header is present but invalid: must flag.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasFramingError(), "empty Content-Length flags a framing error");
+  }
+  {
     // Trailing garbage.
     HTTP::Parser P;
     std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 0x\r\n\r\n";

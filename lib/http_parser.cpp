@@ -380,7 +380,7 @@ void HTTP::Parser::Proxy(Socket::Connection &from, Socket::Connection &to){
       }
     }
   }else{
-    unsigned int bodyLen = length;
+    size_t bodyLen = length; // was unsigned int: silently truncated valid >4GiB lengths
     while (bodyLen > 0 && to.connected() && from.connected()){
       if (from.Received().size() || from.spool()){
         if (from.Received().get().size() <= bodyLen){
@@ -615,7 +615,9 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           currentLength = 0;
           body.clear();
           knownLength = false;
-          if (GetHeader("Content-Length") != ""){
+          if (hasHeader("Content-Length")){
+            // hasHeader, not a value check: an EMPTY Content-Length header is
+            // present-but-invalid and must flag, not silently bypass validation.
             // Strict manual parse, not atoi: atoi overflow on an oversized value
             // is undefined and, fed into body.reserve(), threw an uncaught
             // length_error - a remote peer could kill any Mist HTTP client with
