@@ -296,18 +296,21 @@ namespace Util{
   bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append) {
     // Send final chunk if in chunked mode
     if (conn && conn.isChunkedMode()) {
+      uint64_t finalizeStart = Util::bootMS();
       conn.SendNow(0, 0);
       HTTP::Parser response;
       bool gotResponse = false;
       Event::Loop ev;
       auto attemptFinish = [&]() {
         if (response.Read(conn)) {
-          INFO_MSG("Server response to upload (before %s): %s %s", uri.c_str(), response.url.c_str(), response.method.c_str());
-          // If the response is a 2XX code, return 0, otherwise return the default response (2).
+          uint64_t finalizeMs = Util::bootMS() - finalizeStart;
+          // Record the final status of every completed upload (observability only; nothing acts on it here)
           if (response.url.size() && response.url[0] == '2') {
-            // Success
+            INFO_MSG("Server response to upload (before %s): %s %s (confirmed 2xx after %" PRIu64 " ms)",
+                     uri.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
           } else {
-            // Failure
+            WARN_MSG("Non-2xx server response to upload (before %s): %s %s (after %" PRIu64 " ms)",
+                     uri.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
           }
           gotResponse = true;
         }
@@ -319,7 +322,10 @@ namespace Util{
       uint64_t maxWait = Util::bootMS() + 5000;
       attemptFinish();
       while (!gotResponse && Util::bootMS() < maxWait) { ev.await(1000); }
-      if (!gotResponse) { WARN_MSG("No reply from remote server to PUT request"); }
+      if (!gotResponse) {
+        WARN_MSG("No reply from remote server to PUT request (%s, waited %" PRIu64 " ms)",
+                 conn ? "connection still open" : "connection lost", (uint64_t)(Util::bootMS() - finalizeStart));
+      }
       conn.close();
     }
     HTTP::URL target = HTTP::localURIResolver().link(uri);

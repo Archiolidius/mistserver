@@ -611,8 +611,10 @@ namespace HTTP{
     while (++loop <= retryCount) { // loop while we are unsuccessful
       MEDIUM_MSG("PUTting to %s (%zu/%" PRIu32 ")", link.getUrl().c_str(), loop, retryCount);
       setHeader("X-Attempt", std::to_string(loop));
+      uint64_t attemptStart = Util::bootMS();
       prepareRequest(link, "PUT", conn);
       if (!conn) { continue; } // No connection? Retry up to retryCount times.
+      uint64_t openMs = Util::bootMS() - attemptStart; // time spent on connect + TLS handshake
       conn.setChunkedMode(false);
       H.SetHeader("Expect", "100-continue");
       H.SetHeader("Transfer-Encoding", "chunked");
@@ -622,6 +624,7 @@ namespace HTTP{
       Event::Loop ev;
       ev.addSocket(1, conn.getSocket());
       uint64_t now = Util::bootMS();
+      uint64_t waitStart = now;
       uint64_t deadLine = now + 5000;
       while (true) {
         bool atLeastOnce = true;
@@ -643,18 +646,21 @@ namespace HTTP{
             size_t sp1 = line.find(' ');
             size_t sp2 = line.find(' ', sp1 + 1);
             if (sp1 != std::string::npos && sp2 != std::string::npos && line.substr(sp1 + 1, sp2 - sp1 - 1) == "100") {
-              INFO_MSG("Server approved PUT request for %s: %s", link.getUrl().c_str(), line.c_str() + sp2 + 1);
+              INFO_MSG("Server approved PUT request for %s: %s (open %" PRIu64 " ms, 100-continue %" PRIu64 " ms)",
+                       link.getUrl().c_str(), line.c_str() + sp2 + 1, openMs, Util::bootMS() - waitStart);
               conn.Received().clear();
               return true;
             }
-            INFO_MSG("Server denied PUT request for %s: %s", link.getUrl().c_str(), line.c_str());
+            INFO_MSG("Server denied PUT request for %s: %s (open %" PRIu64 " ms, %" PRIu64 " ms wait)",
+                     link.getUrl().c_str(), line.c_str(), openMs, Util::bootMS() - waitStart);
             conn.close();
             return false;
           }
         }
         now = Util::bootMS();
         if (now >= deadLine || !conn) {
-          WARN_MSG("No response to PUT request from server for %s", link.getUrl().c_str());
+          WARN_MSG("No response to PUT request from server for %s (%s, open %" PRIu64 " ms, waited %" PRIu64 " ms)",
+                   link.getUrl().c_str(), conn ? "timeout" : "connection lost", openMs, now - waitStart);
           conn.close();
           return false;
         }
