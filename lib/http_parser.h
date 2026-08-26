@@ -54,6 +54,12 @@ namespace HTTP{
     void Proxy(Socket::Connection &from, Socket::Connection &to);
     void Clean();
     void CleanPreserveHeaders();
+    /// True when the parsed message carried Content-Length more than once, in any
+    /// case combination. The headers map is case-sensitive and SetHeader
+    /// overwrites, so duplicate or case-variant Content-Length fields are
+    /// otherwise invisible to GetHeader-based validation. Connection-reuse logic
+    /// must refuse such responses (framing/smuggling guard).
+    bool hasDuplicateContentLength() const{return duplicateContentLength;}
     void auth(const std::string &user, const std::string &pass, const std::string &authReq,
               const std::string &headerName = "Authorization");
     std::string body;
@@ -79,6 +85,8 @@ namespace HTTP{
     bool parse(std::string & HTTPbuffer, std::function<void(const char *, size_t)> onData = 0);
     std::string builder;
     std::string read_buffer;
+    bool duplicateContentLength = false; ///< See hasDuplicateContentLength()
+    bool seenContentLengthHdr = false;   ///< Parse-time tracker for the above
     std::map<std::string, std::string> headers;
     std::map<std::string, std::string> vars;
     void Trim(std::string &s);

@@ -1659,6 +1659,13 @@ namespace Mist{
     bool reInitPlaylist = false;
     bool autoAdjustSplit = false;
     Socket::Connection plsConn;
+    // Persistent-connection state for the two upload streams (MIST_PUT_PERSISTENT,
+    // YouTube HLS push targets only). One uploader per target so playlist and
+    // segment connections persist independently and a failure on one never
+    // disturbs the other. Passed as null for non-YouTube targets: generic
+    // segmented HTTP outputs keep connect-per-upload untouched.
+    Util::PersistentUploader plsUploader;
+    Util::PersistentUploader segUploader;
     uint64_t systemBoot;
     bool addEndlist = true;
     // YouTube-push playlist recovery (scoped via targetParams["ytHlsPush"] plus env
@@ -1885,9 +1892,9 @@ namespace Mist{
             // recovery cannot cover this call; without a deadline (recovery enabled but
             // MIST_PUT_DEADLINE_MS unset) a stalled endpoint would block here forever.
             // Failure still returns 1 exactly as before - only the waiting is bounded.
-            Util::openNextUpload(playlistLocationString, plsConn, false, Util::bootMS() + plsRecoveryCapMS, targetParams.count("ytHlsPush"));
+            Util::openNextUpload(playlistLocationString, plsConn, false, Util::bootMS() + plsRecoveryCapMS, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &plsUploader : 0);
           }else{
-            Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"));
+            Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &plsUploader : 0);
           }
           // Write initial contents to the playlist file
           if (!plsConn){
@@ -1929,7 +1936,7 @@ namespace Mist{
         INFO_MSG("Outputting %s to stdout with %s format", streamName.c_str(),
                  capa["name"].asString().c_str());
       }else{
-        if (!Util::externalWriter(newTarget, myConn, targetParams.count("append"), targetParams.count("ytHlsPush"))) {
+        if (!Util::externalWriter(newTarget, myConn, targetParams.count("append"), targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &segUploader : 0)) {
           onFail("Could not connect to the target for recording", true);
           recEndTrigger();
           return 3;
@@ -2220,7 +2227,7 @@ namespace Mist{
                   // Reinit the playlist with the new targetDuration
                   uint64_t unixMs = M.packetTimeToUnixMs(currentStartTime, systemBoot);
                   reinitPlaylist(playlistBuffer, targetAge, maxEntries, segmentCount, segmentsRemoved, unixMs, targetDuration, playlistLocation);
-                  Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"));
+                  Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &plsUploader : 0);
                 }
                 // Else we are in a sliding window playlist, so it will automatically get overwritten
               }
@@ -2237,7 +2244,7 @@ namespace Mist{
                   playlistBuffer = "";
                 // Else re-open the file to force an overwrite
                 } else if (!plsRecovery) {
-                  if (Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"))) {
+                  if (Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &plsUploader : 0)) {
                     plsConn.SendNow(playlistBuffer);
                   }
                 } else {
@@ -2246,7 +2253,7 @@ namespace Mist{
                   // playlistBuffer intact (it holds the complete sliding window) and retry
                   // at the next segment boundary.
                   uint64_t capDeadline = lastPlaylistConfirmMS + plsRecoveryCapMS;
-                  Util::PutFinalizeResult fin = Util::finalizePreviousUpload(plsConn, playlistLocationString, capDeadline);
+                  Util::PutFinalizeResult fin = Util::finalizePreviousUpload(plsConn, playlistLocationString, capDeadline, targetParams.count("ytHlsPush") ? &plsUploader : 0);
                   // A confirmed 2xx is proof of ingestion, so credit it before testing the
                   // cap: an outage that ends inside the last seconds of the window must not
                   // tear the push down on evidence that already arrived.
@@ -2269,7 +2276,7 @@ namespace Mist{
                   // The remaining cap budget is threaded down as the PUT deadline, so a
                   // single open attempt can never overshoot the cap.
                   if (capReached()){break;}
-                  bool plsOpened = Util::openNextUpload(playlistLocationString, plsConn, false, capDeadline, targetParams.count("ytHlsPush"));
+                  bool plsOpened = Util::openNextUpload(playlistLocationString, plsConn, false, capDeadline, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &plsUploader : 0);
                   if (plsOpened){
                     plsConn.SendNow(playlistBuffer);
                   }else{
@@ -2315,7 +2322,7 @@ namespace Mist{
             if (plsRecovery){
               // Same split as the playlist site: finalize (bounded by the remaining cap
               // budget), then open with that budget threaded down as the PUT deadline.
-              Util::PutFinalizeResult segFin = Util::finalizePreviousUpload(myConn, newTarget, lastPlaylistConfirmMS + plsRecoveryCapMS);
+              Util::PutFinalizeResult segFin = Util::finalizePreviousUpload(myConn, newTarget, lastPlaylistConfirmMS + plsRecoveryCapMS, targetParams.count("ytHlsPush") ? &segUploader : 0);
               // Recorded now, read at the next boundary, and derived from the SAME segment
               // this finalize belongs to: prevCycleSegmentOpenOk still holds that segment's
               // open result here (it is updated further down). Requiring positive evidence
@@ -2331,9 +2338,9 @@ namespace Mist{
               if (segFin == Util::PUT_FIN_PERMANENT){
                 WARN_MSG("Segment upload rejected (4xx) for `%s` - not counted as delivered", newTarget.c_str());
               }
-              segmentOpened = Util::openNextUpload(newTarget, myConn, false, lastPlaylistConfirmMS + plsRecoveryCapMS, targetParams.count("ytHlsPush"));
+              segmentOpened = Util::openNextUpload(newTarget, myConn, false, lastPlaylistConfirmMS + plsRecoveryCapMS, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &segUploader : 0);
             }else{
-              segmentOpened = Util::externalWriter(newTarget, myConn, false, targetParams.count("ytHlsPush"));
+              segmentOpened = Util::externalWriter(newTarget, myConn, false, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &segUploader : 0);
             }
             if (!segmentOpened) {
               if (!plsRecovery){
@@ -2392,7 +2399,7 @@ namespace Mist{
     // Write last segment
     if (targetParams.count("m3u8") && (firstPacketTime != 0xFFFFFFFFFFFFFFFFull) && (lastPacketTime - firstPacketTime > 0)){
       // If this is a non-live source, we can finally open up the connection to the playlist file
-      if (!M.getLive()) { Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush")); }
+      if (!M.getLive()) { Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &plsUploader : 0); }
       if (plsConn){
 
         if (lastPacketTime - currentStartTime > 0){
@@ -2438,7 +2445,7 @@ namespace Mist{
         if (!maxEntries && !targetAge) {
           plsConn.SendNow(playlistBuffer);
         // Else re-open the file to force an overwrite
-        } else if (Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"))) {
+        } else if (Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"), targetParams.count("ytHlsPush") ? &plsUploader : 0)) {
           plsConn.SendNow(playlistBuffer);
         }
         // Finish the playlist chunk if needed

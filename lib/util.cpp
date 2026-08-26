@@ -289,12 +289,67 @@ namespace Util{
     }
   }
 
+  /// Parses MIST_PUT_DEADLINE_MS once (see openNextUpload for the format rules).
+  /// 0 = legacy blocking behavior.
+  static int64_t putDeadlineBudgetMS(){
+    static int64_t putBudgetMS = -1;
+    if (putBudgetMS < 0) {
+      putBudgetMS = 0;
+      const char *envBudget = getenv("MIST_PUT_DEADLINE_MS");
+      if (envBudget && *envBudget) {
+        char *endPtr = 0;
+        long long parsed = strtoll(envBudget, &endPtr, 10);
+        if (!*endPtr && parsed == 0) {
+          // Explicit "0" is the documented way to keep legacy behavior: stay silent.
+        } else if (*endPtr || parsed < 1000 || parsed > 600000) {
+          WARN_MSG("Ignoring MIST_PUT_DEADLINE_MS='%s' (needs a plain integer of 1000-600000 ms)", envBudget);
+        } else {
+          putBudgetMS = parsed;
+          INFO_MSG("PUT deadline mode active: %" PRId64 " ms budget per upload", putBudgetMS);
+        }
+      }
+    }
+    return putBudgetMS;
+  }
+
+  /// MIST_PUT_PERSISTENT: reuse one HTTPS connection per upload target instead of
+  /// reconnecting per request (YouTube HLS ingest requires "a persistent
+  /// connection for all requests"). Deliberately inert without MIST_PUT_DEADLINE_MS:
+  /// the legacy (no-deadline) startPut path returns false without retrying once a
+  /// request head is sent, so a stale reused socket would silently drop an upload.
+  /// With the deadline set, a stale socket is retried by the existing bounded loop
+  /// and the reconnect counts as a normal attempt.
+  static bool putPersistActive(){
+    static int8_t mode = -1;
+    if (mode < 0) {
+      mode = 0;
+      const char *envP = getenv("MIST_PUT_PERSISTENT");
+      if (envP && *envP) {
+        if (!strcmp(envP, "1") || !strcasecmp(envP, "true")) {
+          if (putDeadlineBudgetMS() > 0) {
+            mode = 1;
+            INFO_MSG("Persistent PUT connections active (per upload target)");
+          } else {
+            INFO_MSG("MIST_PUT_PERSISTENT is set but inert: it requires MIST_PUT_DEADLINE_MS");
+          }
+        } else if (strcmp(envP, "0") && strcasecmp(envP, "false")) {
+          WARN_MSG("Ignoring MIST_PUT_PERSISTENT='%s' (use 1/true to enable)", envP);
+        }
+      }
+    }
+    return mode == 1;
+  }
+
+  PersistentUploader::PersistentUploader() : dl(new HTTP::Downloader()) {}
+  PersistentUploader::~PersistentUploader() { delete dl; }
+  HTTP::Downloader &PersistentUploader::downloader() { return *dl; }
+
   /// \brief Finalizes the previous chunked upload on the given connection, if any.
   /// Sends the final zero chunk, waits up to 5 s for the server's final response,
   /// classifies it, and closes the connection. Timing and logging are identical to the
   /// historical externalWriter behavior; the classification is returned instead of
   /// being discarded.
-  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint, uint64_t deadlineMS) {
+  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint, uint64_t deadlineMS, PersistentUploader *uploader) {
     // A connection still in chunked mode had an upload in flight. If it is already dead,
     // the peer killed that upload (a body write detected the drop) - report it as the
     // transient failure it was, not as "nothing to finalize", so callers tracking
@@ -361,6 +416,52 @@ namespace Util{
                conn ? "connection still open" : "connection lost", (uint64_t)(Util::bootMS() - finalizeStart));
       if (!conn) { result = PUT_FIN_TRANSIENT; }
     }
+    // Connection-reuse eligibility (MIST_PUT_PERSISTENT). Every condition must
+    // hold; anything else falls through to the unconditional close below, so the
+    // worst case is exactly the legacy behavior. The rules, and why each exists:
+    //  - a confirmed 2xx on HTTP/1.1 without a "Connection: close" token;
+    //  - generation match: the connection must still be the one this uploader
+    //    last used - an address or fd can repeat after close()/open(), the
+    //    generation cannot, so a swap we never observed (Downloader-internal
+    //    reconnect, /dev/null segment fallback) disqualifies automatically;
+    //  - length-delimited framing only: the response parser returns at a chunked
+    //    response's zero-size chunk WITHOUT consuming the terminator or trailers,
+    //    and "no residual bytes visible" cannot prove otherwise (they may sit in
+    //    the kernel or arrive later), so ANY chunked final response closes. A
+    //    valid Content-Length is required in full-string digits - not atoi,
+    //    which accepts trailing garbage - with no Transfer-Encoding header and
+    //    no duplicate Content-Length (case-insensitive; the parser flags these,
+    //    since its case-sensitive header map cannot expose them afterwards);
+    //  - an empty receive buffer after the parse.
+    if (uploader) {
+      uploader->reusable = false;
+      if (putPersistActive() && gotResponse && result == PUT_FIN_OK_2XX && conn &&
+          conn.getGeneration() == uploader->lastGeneration &&
+          response.protocol == "HTTP/1.1" && !response.hasDuplicateContentLength() &&
+          !conn.Received().size()) {
+        std::string connHdr = response.GetHeader("Connection");
+        Util::stringToLower(connHdr);
+        bool closeRequested = connHdr.find("close") != std::string::npos;
+        bool lengthDelimited = false;
+        if (!response.GetHeader("Transfer-Encoding").size()) {
+          const std::string &cl = response.GetHeader("Content-Length");
+          if (response.url.size() >= 3 && response.url.substr(0, 3) == "204") {
+            lengthDelimited = true;
+          } else if (cl.size() && cl.size() <= 18) {
+            lengthDelimited = true;
+            for (size_t ci = 0; ci < cl.size(); ++ci) {
+              if (cl[ci] < '0' || cl[ci] > '9') { lengthDelimited = false; break; }
+            }
+          }
+        }
+        if (lengthDelimited && !closeRequested) {
+          uploader->reusable = true;
+          // Stays nonblocking: the deadline-mode request path (the only mode
+          // persistence runs in, see putPersistActive) expects exactly that.
+          return result;
+        }
+      }
+    }
     conn.close();
     return result;
   }
@@ -369,15 +470,15 @@ namespace Util{
   /// \param uri target URL or filepath
   /// \param outFile file descriptor which will be used to send data
   /// \param append whether to open this connection in truncate or append mode
-  bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append, bool ytPushIdentity) {
+  bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append, bool ytPushIdentity, PersistentUploader *uploader) {
     // Send final chunk if in chunked mode (historical behavior: result ignored)
-    finalizePreviousUpload(conn, uri);
-    return openNextUpload(uri, conn, append, 0, ytPushIdentity);
+    finalizePreviousUpload(conn, uri, 0, uploader);
+    return openNextUpload(uri, conn, append, 0, ytPushIdentity, uploader);
   }
 
   /// \brief The "open" half of externalWriter: connects the given connection to a file
   /// or uploader binary without touching any previous upload state on it.
-  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append, uint64_t deadlineMS, bool ytPushIdentity) {
+  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append, uint64_t deadlineMS, bool ytPushIdentity, PersistentUploader *uploader) {
     HTTP::URL target = HTTP::localURIResolver().link(uri);
 
     // Local paths just write to file
@@ -440,7 +541,20 @@ namespace Util{
     }
     if (target.protocol == "http" || target.protocol == "https") {
       HIGH_MSG("Using native HTTP PUT handler with protocol %s", target.protocol.c_str());
-      HTTP::Downloader dl;
+      HTTP::Downloader localDl;
+      bool persist = uploader && putPersistActive();
+      // The persisted Downloader is the reuse authority: its connectedHost/Port/
+      // TLS state lets prepareRequest keep a matching live socket. A fresh local
+      // Downloader (the non-persistent path) has empty state, so prepareRequest
+      // reconnects - exactly the legacy behavior.
+      HTTP::Downloader &dl = persist ? uploader->downloader() : localDl;
+      if (persist && conn &&
+          !(uploader->reusable && conn.getGeneration() == uploader->lastGeneration)) {
+        // Not eligible for reuse: force a fresh connection. Without this,
+        // prepareRequest would happily keep an open socket to the same host even
+        // though finalize refused to certify its message boundary.
+        conn.close();
+      }
       target = HTTP::injectHeaders(target, "PUT", dl);
       // MIST_PUT_USER_AGENT: on YouTube HLS push uploads only (ytPushIdentity is set
       // by exactly those call sites), identify LiveReacting in the User-Agent format
@@ -468,28 +582,20 @@ namespace Util{
       // the legacy blocking behavior byte-for-byte. Values outside 1000-600000 ms, or
       // any value that is not a plain integer, are rejected with a warning and disable
       // the mode: a typo like "1e5" would otherwise parse as a 1 ms budget and fail
-      // every single upload.
-      static int64_t putBudgetMS = -1;
-      if (putBudgetMS < 0) {
-        putBudgetMS = 0;
-        const char *envBudget = getenv("MIST_PUT_DEADLINE_MS");
-        if (envBudget && *envBudget) {
-          char *endPtr = 0;
-          long long parsed = strtoll(envBudget, &endPtr, 10);
-          if (!*endPtr && parsed == 0) {
-            // Explicit "0" is the documented way to keep legacy behavior: stay silent.
-          } else if (*endPtr || parsed < 1000 || parsed > 600000) {
-            WARN_MSG("Ignoring MIST_PUT_DEADLINE_MS='%s' (needs a plain integer of 1000-600000 ms)", envBudget);
-          } else {
-            putBudgetMS = parsed;
-            INFO_MSG("PUT deadline mode active: %" PRId64 " ms budget per upload", putBudgetMS);
-          }
-        }
-      }
+      // every single upload. (Parsing lives in putDeadlineBudgetMS so the
+      // persistence gate can require deadline mode.)
+      int64_t putBudgetMS = putDeadlineBudgetMS();
       uint64_t putDeadline = putBudgetMS ? Util::bootMS() + putBudgetMS : 0;
       // A caller-provided deadline can only tighten the budget, never extend it.
       if (deadlineMS && (!putDeadline || deadlineMS < putDeadline)) { putDeadline = deadlineMS; }
       if (!dl.startPut(target, conn, 6, putDeadline)) { return false; }
+      if (persist) {
+        // Record which connection this uploader just used. finalize certifies (or
+        // refuses) reuse against this exact generation next cycle; until then the
+        // connection is not reusable.
+        uploader->lastGeneration = conn.getGeneration();
+        uploader->reusable = false;
+      }
       return true;
     }
     ERROR_MSG("Could not connect to '%s', since we do not have a configured external writer to "

@@ -1021,6 +1021,13 @@ Socket::Connection::Connection(){
 void Socket::Connection::resetCounter(){
   up = 0;
   down = 0;
+  // A deliberate reset clears the lifetime accumulators too - otherwise this
+  // method would silently stop resetting for callers once reconnect folding
+  // exists. The generation is intentionally NOT reset: identity must never
+  // repeat within an object's lifetime.
+  lifeUp = 0;
+  lifeDown = 0;
+  sessionStart = 0;
 }
 
 void Socket::Connection::addUp(const uint32_t i){
@@ -1063,6 +1070,19 @@ void Socket::Connection::close(){
 /// This function does *not* call shutdown, allowing continued use in other
 /// processes.
 void Socket::Connection::drop(){
+  // Fold the ending connection's counters into the object-lifetime accumulators
+  // BEFORE anything clears them, so dataUp()/dataDown() stay cumulative and
+  // monotonic across reconnects (including ones performed inside callees, e.g.
+  // Downloader retry loops) and connTime() keeps reporting the first connect.
+  // resetCounter() is the one deliberate full reset. The generation bump makes
+  // any close-and-reopen detectable by exact match; spurious bumps from
+  // dropping an already-closed connection are harmless (only equality is used).
+  lifeUp += up;
+  lifeDown += down;
+  up = 0;
+  down = 0;
+  if (!sessionStart){sessionStart = conntime;}
+  ++generation;
   upBuffer.clear();
 #ifdef SSL
   if (sslConnected){
@@ -1550,18 +1570,27 @@ bool Socket::Connection::connected() const{
 }
 
 /// Returns the time this socket has been connected.
+/// Reports the FIRST connect of this object once any reconnect happened, so
+/// elapsed-time consumers (now - connTime()) never see time move backwards.
 unsigned int Socket::Connection::connTime(){
-  return conntime;
+  return sessionStart ? sessionStart : conntime;
 }
 
-/// Returns total amount of bytes sent.
+/// Returns total amount of bytes sent (cumulative across reconnects of this object).
 uint64_t Socket::Connection::dataUp(){
-  return up;
+  return lifeUp + up;
 }
 
-/// Returns total amount of bytes received.
+/// Returns total amount of bytes received (cumulative across reconnects of this object).
 uint64_t Socket::Connection::dataDown(){
-  return down;
+  return lifeDown + down;
+}
+
+/// Reconnect generation: bumped on every drop(). Reuse logic records the value
+/// after using a connection and reuses only on an exact match later - an
+/// address or file descriptor can repeat after close()/open(), this cannot.
+uint64_t Socket::Connection::getGeneration() const{
+  return generation;
 }
 
 /// Updates the downbuffer internal variable.

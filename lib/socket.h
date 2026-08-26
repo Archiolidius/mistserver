@@ -148,6 +148,15 @@ namespace Socket{
     uint64_t up;
     uint64_t down;
     long long int conntime;
+    // Object-lifetime accumulators and reconnect generation (maintained in drop(),
+    // cleared only by resetCounter()). They keep dataUp()/dataDown()/connTime()
+    // cumulative and monotonic across reconnects of this object - stats consumers
+    // treat a decreasing counter as an error - and give reuse logic an exact-match
+    // identity that detects a close-and-reopen even when it happened inside a callee.
+    uint64_t lifeUp = 0;            ///< Bytes sent on prior connections of this object
+    uint64_t lifeDown = 0;          ///< Bytes received on prior connections of this object
+    long long int sessionStart = 0; ///< First connect time, preserved across reconnects
+    uint64_t generation = 0;        ///< Bumped on every drop; never reset
     Buffer downbuffer; ///< Stores received data (both in blocking and non-blocking modes)
     Buffer upBuffer; ///< In non-blocking mode, buffers outgoing writes
     int iread(void *buffer, int len, int flags = 0);  ///< Incremental read call.
@@ -232,6 +241,7 @@ namespace Socket{
     uint64_t dataUp();       ///< Returns total amount of bytes sent.
     uint64_t dataDown();     ///< Returns total amount of bytes received.
     void resetCounter();     ///< Resets the up/down bytes counter to zero.
+    uint64_t getGeneration() const; ///< Reconnect generation; exact match = same live connection.
     void addUp(const uint32_t i);
     void addDown(const uint32_t i);
     friend class Server;

@@ -24,6 +24,15 @@ test('5xx at open retries in place', downloaderputtest, args: ['deny500retry'], 
 test('4xx at open fails immediately', downloaderputtest, args: ['deny403'], suite: 'Downloader PUT')
 test('silent server cannot hang the pusher', downloaderputtest, args: ['deadline'], suite: 'Downloader PUT')
 test('push User-Agent replaces by name, push-only', downloaderputtest, args: ['ua'], suite: 'Downloader PUT')
+test('persistent: reuse across uploads', downloaderputtest, args: ['persist'], suite: 'Downloader PUT')
+test('persistent: gate off reconnects per upload', downloaderputtest, args: ['persistoff'], suite: 'Downloader PUT')
+test('persistent: inert without the deadline', downloaderputtest, args: ['persistnodeadline'], suite: 'Downloader PUT')
+test('persistent: chunked response never reused', downloaderputtest, args: ['persistchunked'], suite: 'Downloader PUT')
+test('persistent: Connection close never reused', downloaderputtest, args: ['persistclose'], suite: 'Downloader PUT')
+test('persistent: duplicate Content-Length never reused', downloaderputtest, args: ['persistdupcl'], suite: 'Downloader PUT')
+test('persistent: idle-close reconnects transparently', downloaderputtest, args: ['persistidle'], suite: 'Downloader PUT')
+test('persistent: descriptor swap forces reconnect', downloaderputtest, args: ['persistswap'], suite: 'Downloader PUT')
+test('socket counters cumulative and monotonic', downloaderputtest, args: ['statsmono'], suite: 'Downloader PUT')
 
 # Session-token source for MIST_HLS_UNIQUE_SEGMENTS (unique segment naming).
 securerandomtest = executable('securerandomtest', 'secure_random.cpp', header_tgts, dependencies: libmist_dep)

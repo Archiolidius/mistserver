@@ -34,6 +34,8 @@ void HTTP::Parser::Clean(){
 /// Completely re-initializes the HTTP::Parser, leaving it ready for either reading or writing
 /// usage.
 void HTTP::Parser::CleanPreserveHeaders(){
+  duplicateContentLength = false;
+  seenContentLengthHdr = false;
   seenHeaders = false;
   seenReq = false;
   possiblyComplete = false;
@@ -626,6 +628,16 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           if (f == std::string::npos) continue;
           tmpB = tmpA.substr(0, f);
           tmpC = tmpA.substr(f + 1);
+          {
+            // Case-insensitive duplicate tracking for the framing-critical
+            // Content-Length header; see hasDuplicateContentLength().
+            std::string lowered = tmpB;
+            for (size_t li = 0; li < lowered.size(); ++li){lowered[li] = tolower(lowered[li]);}
+            if (lowered == "content-length"){
+              if (seenContentLengthHdr){duplicateContentLength = true;}
+              seenContentLengthHdr = true;
+            }
+          }
           SetHeader(tmpB, tmpC);
         }
       }

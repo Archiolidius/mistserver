@@ -12,6 +12,8 @@
 #include <mist/timing.h>
 #include <mist/util.h>
 
+#include <fcntl.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
@@ -24,13 +26,20 @@ namespace {
 
   /// What the fake server does with one incoming PUT request.
   enum ServerBehavior {
-    ACCEPT_THEN_200,  ///< 100 Continue, read the body, answer 200
-    ACCEPT_THEN_403,  ///< 100 Continue, read the body, answer 403
-    ACCEPT_THEN_500,  ///< 100 Continue, read the body, answer 500
+    ACCEPT_THEN_200,  ///< 100 Continue, read the body, answer 200, close
+    ACCEPT_THEN_403,  ///< 100 Continue, read the body, answer 403, close
+    ACCEPT_THEN_500,  ///< 100 Continue, read the body, answer 500, close
     ACCEPT_THEN_QUIET,///< 100 Continue, read the body, never answer
     DENY_500,         ///< answer 500 instead of the 100 Continue
     DENY_403,         ///< answer 403 instead of the 100 Continue
-    NEVER_RESPOND     ///< read the request, send nothing at all
+    NEVER_RESPOND,    ///< read the request, send nothing at all
+    // Keep-alive behaviors for the persistent-connection (MIST_PUT_PERSISTENT)
+    // cases: answer and KEEP the connection open for a next request.
+    KEEP_200,         ///< 200 with Content-Length: 0, connection kept open
+    KEEP_200_CHUNKED, ///< 200 with a chunked (zero-chunk) final response, kept open
+    KEEP_200_CLOSEHDR,///< 200 with "Connection: close", then actually close
+    KEEP_200_DUPCL,   ///< 200 with two Content-Length headers (case variants), kept open
+    KEEP_200_THEN_DROP///< 200 kept open, then the server closes it (idle-close)
   };
 
   std::condition_variable cv;
@@ -41,6 +50,7 @@ namespace {
   size_t served = 0;
   std::atomic<bool> stopServing(false);
   std::vector<std::string> requestHeaders; ///< headers of each served request, script order (guarded by mut)
+  std::atomic<int> acceptCount(0); ///< distinct TCP connections the server accepted
 
   /// Serves as many requests as the script has entries, one behavior each.
   void serving(){
@@ -66,64 +76,92 @@ namespace {
         Util::sleep(10);
         continue;
       }
+      ++acceptCount;
       C.setBlocking(false);
-      ServerBehavior behavior = script[served++];
-      // Read the request headers (they end with a blank line).
-      uint64_t giveUp = Util::bootMS() + 5000;
-      std::string req;
-      while (C && Util::bootMS() < giveUp && req.find("\r\n\r\n") == std::string::npos){
-        if (C.spool()){
-          while (C.Received().size()){
-            req += C.Received().get();
-            C.Received().get().clear();
+      // One accepted connection may serve several requests (keep-alive
+      // behaviors); each request consumes one script entry.
+      bool keepConn = true;
+      bool parked = false; // pushed to `held`: must NOT be closed here (close() shutdowns the shared fd)
+      while (keepConn && !stopServing && served < script.size()){
+        ServerBehavior behavior = script[served];
+        // Read the request headers (they end with a blank line).
+        uint64_t giveUp = Util::bootMS() + 5000;
+        std::string req;
+        while (C && Util::bootMS() < giveUp && req.find("\r\n\r\n") == std::string::npos){
+          if (C.spool()){
+            while (C.Received().size()){
+              req += C.Received().get();
+              C.Received().get().clear();
+            }
+          }else{
+            Util::sleep(5);
           }
-        }else{
-          Util::sleep(5);
+        }
+        if (req.find("\r\n\r\n") == std::string::npos){
+          // No request arrived on this connection (died or idle): do not consume
+          // the script entry - the client will reconnect for it.
+          break;
+        }
+        served++;
+        {
+          std::lock_guard<std::mutex> g(mut);
+          requestHeaders.push_back(req);
+        }
+        if (behavior == NEVER_RESPOND){
+          held.push_back(C);
+          parked = true;
+          keepConn = false;
+          break;
+        }
+        if (behavior == DENY_500){
+          C.SendNow("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+          C.close();
+          break;
+        }
+        if (behavior == DENY_403){
+          C.SendNow("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+          C.close();
+          break;
+        }
+        C.SendNow("HTTP/1.1 100 Continue\r\n\r\n");
+        // Drain the chunked body until the terminating zero chunk arrives.
+        giveUp = Util::bootMS() + 5000;
+        std::string body;
+        while (C && Util::bootMS() < giveUp && body.find("0\r\n\r\n") == std::string::npos){
+          if (C.spool()){
+            while (C.Received().size()){
+              body += C.Received().get();
+              C.Received().get().clear();
+            }
+          }else{
+            Util::sleep(5);
+          }
+        }
+        switch (behavior){
+        case ACCEPT_THEN_200: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); keepConn = false; break;
+        case ACCEPT_THEN_403: C.SendNow("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); keepConn = false; break;
+        case ACCEPT_THEN_500: C.SendNow("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); keepConn = false; break;
+        case KEEP_200: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); break;
+        case KEEP_200_CHUNKED: C.SendNow("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"); break;
+        case KEEP_200_CLOSEHDR: C.SendNow("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"); keepConn = false; break;
+        case KEEP_200_DUPCL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n"); break;
+        case KEEP_200_THEN_DROP: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); Util::sleep(50); keepConn = false; break;
+        default: break; // ACCEPT_THEN_QUIET answers nothing
+        }
+        if (behavior == ACCEPT_THEN_QUIET){
+          held.push_back(C);
+          parked = true;
+          keepConn = false;
+          break;
         }
       }
-      {
-        std::lock_guard<std::mutex> g(mut);
-        requestHeaders.push_back(req);
-      }
-      if (behavior == NEVER_RESPOND){
-        held.push_back(C);
+      if (!keepConn){
+        if (!parked){C.close();}
         continue;
       }
-      if (behavior == DENY_500){
-        C.SendNow("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
-        C.close();
-        continue;
-      }
-      if (behavior == DENY_403){
-        C.SendNow("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
-        C.close();
-        continue;
-      }
-      C.SendNow("HTTP/1.1 100 Continue\r\n\r\n");
-      // Drain the chunked body until the terminating zero chunk arrives.
-      giveUp = Util::bootMS() + 5000;
-      std::string body;
-      while (C && Util::bootMS() < giveUp && body.find("0\r\n\r\n") == std::string::npos){
-        if (C.spool()){
-          while (C.Received().size()){
-            body += C.Received().get();
-            C.Received().get().clear();
-          }
-        }else{
-          Util::sleep(5);
-        }
-      }
-      switch (behavior){
-      case ACCEPT_THEN_200: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); break;
-      case ACCEPT_THEN_403: C.SendNow("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); break;
-      case ACCEPT_THEN_500: C.SendNow("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); break;
-      default: break; // ACCEPT_THEN_QUIET answers nothing
-      }
-      if (behavior == ACCEPT_THEN_QUIET){
-        held.push_back(C);
-        continue;
-      }
-      C.close();
+      // Keep-alive connection with no further scripted requests: hold it open so
+      // a client that still owns it sees a live socket, not a drop.
+      held.push_back(C);
     }
     for (size_t i = 0; i < held.size(); ++i){held[i].close();}
     srv.close();
@@ -132,6 +170,7 @@ namespace {
   bool startServer(const std::vector<ServerBehavior> &behaviors, std::thread &t, std::string &url){
     script = behaviors;
     served = 0;
+    acceptCount = 0;
     requestHeaders.clear();
     stopServing = false;
     boundPort = 0;
@@ -183,6 +222,17 @@ namespace {
     }
     conn.SendNow("hello", 5);
     finResult = Util::finalizePreviousUpload(conn, url, deadlineMS);
+    return true;
+  }
+
+  /// Upload using a caller-owned connection and persistent uploader, mirroring
+  /// the output.cpp cycle: finalize the previous upload, open the next, send a
+  /// small body. finResult is the finalize classification of the PREVIOUS upload.
+  bool uploadCycle(const std::string &url, Socket::Connection &conn, Util::PersistentUploader &pu,
+                   Util::PutFinalizeResult &finResult){
+    finResult = Util::finalizePreviousUpload(conn, url, 0, &pu);
+    if (!Util::openNextUpload(url, conn, false, 0, false, &pu)){return false;}
+    conn.SendNow("hello", 5);
     return true;
   }
 
@@ -258,6 +308,183 @@ int main(int argc, char **argv){
     uint64_t spent = Util::bootMS() - start;
     if (ok && spent > 2000){
       ok = fail("4xx at open took " + std::to_string(spent) + "ms, expected an immediate failure");
+    }
+  }else if (testCase == "persist"){
+    // Gate + deadline on, length-delimited keep-alive responses: the second and
+    // third uploads must REUSE the first connection (one accept total).
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200, KEEP_200, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 3; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+      else if (i && r != Util::PUT_FIN_OK_2XX){ok = fail(std::string("prior 200 classified as ") + finName(r));}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 1){ok = fail("expected 1 accepted connection, server saw " + std::to_string(acceptCount));}
+    }
+  }else if (testCase == "persistoff"){
+    // Deadline on but the persistence gate off: every upload reconnects (legacy).
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    if (!startServer({KEEP_200, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("gate off must reconnect per upload, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistnodeadline"){
+    // Persistence gate on WITHOUT the deadline: inert by design (the no-deadline
+    // startPut path cannot retry a stale socket), so behavior stays legacy.
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    unsetenv("MIST_PUT_DEADLINE_MS");
+    if (!startServer({KEEP_200, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("persistence without deadline must stay inert, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistchunked"){
+    // A chunked final response is NEVER reusable, even when the visible buffer
+    // looks empty: the parser stops at the zero-size chunk without consuming
+    // the terminator. Both uploads must use fresh connections.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_CHUNKED, KEEP_200_CHUNKED}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+      else if (i && r != Util::PUT_FIN_OK_2XX){ok = fail(std::string("chunked 200 classified as ") + finName(r));}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("chunked responses must not be reused, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistclose"){
+    // "Connection: close" in the final response forbids reuse.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_CLOSEHDR, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("Connection: close must forbid reuse, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistdupcl"){
+    // Duplicate Content-Length headers (case variants) are a framing hazard the
+    // case-sensitive header map cannot expose after parsing; reuse must refuse.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_DUPCL, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("duplicate Content-Length must forbid reuse, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistidle"){
+    // The server idle-closes a reusable connection between cycles: the next
+    // upload must transparently reconnect and still deliver (no stuck state).
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_THEN_DROP, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    if (!uploadCycle(url, conn, pu, r)){ok = fail("first upload could not open");}
+    if (ok){
+      // Give the server time to close the kept connection before the next cycle.
+      Util::sleep(300);
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("post-idle-close upload could not open");}
+      else if (r != Util::PUT_FIN_OK_2XX){ok = fail(std::string("first 200 classified as ") + finName(r));}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("idle-close must trigger one reconnect, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistswap"){
+    // KTD-8 identity gate: after the connection object is redirected elsewhere
+    // (the /dev/null segment-fallback shape), reuse must not engage - the
+    // generation mismatch forces a clean reconnect instead of writing a request
+    // into the wrong descriptor.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    if (!uploadCycle(url, conn, pu, r)){ok = fail("first upload could not open");}
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu); // certifies reuse eligibility
+      int devNull = open("/dev/null", O_WRONLY);
+      if (devNull < 0){ok = fail("could not open /dev/null");}
+      else{
+        conn.open(devNull); // generation bump: no longer the certified connection
+        if (!Util::openNextUpload(url, conn, false, 0, false, &pu)){ok = fail("post-swap upload could not open");}
+        else{
+          conn.SendNow("hello", 5);
+          if (Util::finalizePreviousUpload(conn, url, 0, &pu) != Util::PUT_FIN_OK_2XX){
+            ok = fail("post-swap upload did not complete on a fresh connection");
+          }
+        }
+      }
+      conn.close();
+      if (ok && acceptCount != 2){ok = fail("descriptor swap must force reconnect, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "statsmono"){
+    // Socket::Connection counters must be cumulative and monotonic across
+    // reconnects of one object (stats consumers treat decreases as errors),
+    // connTime() must keep reporting the first connect, and resetCounter()
+    // must still zero everything.
+    int fd1 = open("/dev/null", O_WRONLY);
+    int fd2 = open("/dev/null", O_WRONLY);
+    if (fd1 < 0 || fd2 < 0){ok = fail("could not open /dev/null");}
+    else{
+      Socket::Connection c(fd1, fd1);
+      c.SendNow("0123456789", 10);
+      uint64_t upFirst = c.dataUp();
+      unsigned int t0 = c.connTime();
+      uint64_t genFirst = c.getGeneration();
+      c.open(fd2, fd2); // reconnect: legacy counters would reset here
+      if (c.getGeneration() == genFirst){ok = fail("generation did not change on reopen");}
+      c.SendNow("0123456789", 10);
+      if (ok && c.dataUp() < upFirst + 10){
+        ok = fail("dataUp lost bytes across reopen: " + std::to_string(c.dataUp()));
+      }
+      if (ok && c.connTime() > t0){ok = fail("connTime moved forward across reopen");}
+      c.resetCounter();
+      if (ok && c.dataUp() != 0){ok = fail("resetCounter no longer zeroes dataUp");}
+      c.close();
     }
   }else if (testCase == "ua"){
     // MIST_PUT_USER_AGENT with the ytPushIdentity opt-in must REPLACE the

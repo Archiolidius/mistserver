@@ -12,6 +12,8 @@ namespace Socket {
   class Connection;
 }
 
+namespace HTTP{class Downloader;}
+
 namespace Util{
   bool isDirectory(const std::string &path);
   bool createPathFor(const std::string &file);
@@ -30,18 +32,45 @@ namespace Util{
     PUT_FIN_PERMANENT,  ///< Non-2xx, non-5xx final status (e.g. 403/404)
     PUT_FIN_NO_RESPONSE ///< Connection stayed open but no final response arrived in time
   };
+  class PersistentUploader;
   /// deadlineMS: optional absolute Util::bootMS() deadline that can only shorten the
   /// default 5 s wait for the final response (0 = the legacy 5 s wait).
-  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint = "", uint64_t deadlineMS = 0);
-  /// deadlineMS: optional absolute Util::bootMS() deadline for HTTP(S) targets; the
-  /// effective PUT deadline is the earlier of this and the MIST_PUT_DEADLINE_MS budget.
+  /// uploader: when given (YouTube HLS push sites only), the final response is
+  /// additionally evaluated for connection-reuse eligibility (MIST_PUT_PERSISTENT);
+  /// an eligible connection is left open at its message boundary instead of closed.
+  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint = "", uint64_t deadlineMS = 0, PersistentUploader *uploader = 0);
+  /// Persistent-uploader state for HTTP(S) push targets (MIST_PUT_PERSISTENT).
+  /// Owns an HTTP::Downloader - whose connectedHost/Port/TLS state is the reuse
+  /// authority - and BORROWS the caller's Socket::Connection; it never owns or
+  /// replaces it (body writes, lifecycle checks and statistics keep flowing
+  /// through the connection the caller already owns). `lastGeneration` records
+  /// the connection's generation after our last use; reuse requires an exact
+  /// match, so any close-and-reopen this object did not observe - a Downloader
+  /// retry, an external close, the /dev/null segment fallback swapping the
+  /// descriptor - invalidates reuse automatically.
+  class PersistentUploader {
+  public:
+    PersistentUploader();
+    ~PersistentUploader();
+    ::HTTP::Downloader &downloader();
+    uint64_t lastGeneration = 0;
+    bool reusable = false;
+  private:
+    ::HTTP::Downloader *dl;
+    PersistentUploader(const PersistentUploader &);
+    PersistentUploader &operator=(const PersistentUploader &);
+  };
+
+  // deadlineMS on openNextUpload: optional absolute Util::bootMS() deadline for
+  // HTTP(S) targets; the effective PUT deadline is the earlier of this and the
+  // MIST_PUT_DEADLINE_MS budget.
   // ytPushIdentity: set by the YouTube HLS push call sites only (the callers that
   // know targetParams["ytHlsPush"]). When it and MIST_PUT_USER_AGENT are both set,
   // HTTP(S) uploads carry the spec-format LiveReacting User-Agent. The defaulted
   // parameter preserves every existing caller unchanged - generic uploads
   // (MistUtilWriter, DTSC::Meta::toFile, raw H264 push, local files) never opt in.
-  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append = false, uint64_t deadlineMS = 0, bool ytPushIdentity = false);
-  bool externalWriter(const std::string & file, Socket::Connection & conn, bool append = false, bool ytPushIdentity = false);
+  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append = false, uint64_t deadlineMS = 0, bool ytPushIdentity = false, PersistentUploader *uploader = 0);
+  bool externalWriter(const std::string & file, Socket::Connection & conn, bool append = false, bool ytPushIdentity = false, PersistentUploader *uploader = 0);
 
   int64_t expBackoffMs(const size_t currIter, const size_t maxIter, const int64_t maxWait);
 
