@@ -28,11 +28,14 @@ namespace Mist{
       // outstanding segments; a deeper window makes short upstream stalls survivable
       // for the player. Unset or out-of-range values keep the legacy depth of 3.
       if (const char *envEntries = getenv("MIST_HLS_MAX_ENTRIES")) {
-        int entries = atoi(envEntries);
-        if (entries >= 3 && entries <= 5) {
+        // strtol, not atoi: atoi("5x") returns 5, so a malformed deployment value
+        // would silently change the window depth instead of keeping the default.
+        char *endPtr = 0;
+        long entries = strtol(envEntries, &endPtr, 10);
+        if (!*endPtr && *envEntries && entries >= 3 && entries <= 5) {
           targetParams["maxEntries"] = std::to_string(entries);
         } else {
-          WARN_MSG("Ignoring MIST_HLS_MAX_ENTRIES='%s' (allowed range 3-5)", envEntries);
+          WARN_MSG("Ignoring MIST_HLS_MAX_ENTRIES='%s' (needs a plain integer of 3-5)", envEntries);
         }
       }
       targetParams["nounlink"] = "";

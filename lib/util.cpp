@@ -311,7 +311,11 @@ namespace Util{
                    uriHint.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
           result = PUT_FIN_OK_2XX;
         } else {
-          WARN_MSG("Non-2xx server response to upload (before %s): %s %s (after %" PRIu64 " ms)",
+          // Same leading text as the 2xx line above on purpose: existing log-based
+          // health checks grep for this prefix, and the failures this patch exists to
+          // expose must not be the one case that stops matching. The severity and the
+          // trailing classification carry the difference.
+          WARN_MSG("Server response to upload (before %s): %s %s (NON-2XX after %" PRIu64 " ms)",
                    uriHint.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
           // Only a genuine client-side rejection is permanent. 5xx, 408 (timeout) and
           // 429 (rate limited) are retryable, and an informational 1xx is not a verdict
@@ -336,6 +340,10 @@ namespace Util{
     if (deadlineMS && deadlineMS < maxWait) { maxWait = deadlineMS; }
     attemptFinish();
     while (!gotResponse && Util::bootMS() < maxWait) { ev.await(1000); }
+    // A close-delimited response (no Content-Length, no chunked encoding) is only
+    // reported complete once the peer closes, and the spool loop above stops on that
+    // same close - so try one last parse before calling it a non-reply.
+    if (!gotResponse) { attemptFinish(); }
     if (!gotResponse) {
       WARN_MSG("No reply from remote server to PUT request (%s, waited %" PRIu64 " ms)",
                conn ? "connection still open" : "connection lost", (uint64_t)(Util::bootMS() - finalizeStart));

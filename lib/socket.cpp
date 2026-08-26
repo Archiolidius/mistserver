@@ -1385,8 +1385,11 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
       timeout.tv_usec = 0;
       if (deadlineMS){
         // Clamp the select tick to the remaining budget so a connect attempt cannot
-        // overshoot the deadline by up to a second.
-        uint64_t remainMS = deadlineMS - Util::bootMS();
+        // overshoot the deadline by up to a second. Read the clock once and saturate
+        // at zero: an unsigned subtraction on an already-expired deadline would wrap
+        // to a huge value and silently restore the full one-second tick.
+        uint64_t nowMS = Util::bootMS();
+        uint64_t remainMS = (nowMS >= deadlineMS) ? 0 : deadlineMS - nowMS;
         if (remainMS < 1000){
           timeout.tv_sec = 0;
           timeout.tv_usec = remainMS * 1000;

@@ -72,3 +72,6 @@ subprojects/
 !subprojects/*.wrap
 .vscode/
 scte35-youtube-debug-report.md
+
+# JetBrains IDE project files
+.idea/
