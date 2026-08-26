@@ -36,6 +36,7 @@ void HTTP::Parser::Clean(){
 void HTTP::Parser::CleanPreserveHeaders(){
   duplicateContentLength = false;
   seenContentLengthHdr = false;
+  framingError = false;
   seenHeaders = false;
   seenReq = false;
   possiblyComplete = false;
@@ -615,22 +616,32 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           body.clear();
           knownLength = false;
           if (GetHeader("Content-Length") != ""){
-            // strtoull with full-string validation, not atoi: atoi overflow on an
-            // oversized value is undefined and, fed into body.reserve(), threw an
-            // uncaught length_error - a remote peer could kill any Mist HTTP
-            // client with a single oversized Content-Length header. Unparseable
-            // or absurd values now fall back to close-delimited reading instead.
+            // Strict manual parse, not atoi: atoi overflow on an oversized value
+            // is undefined and, fed into body.reserve(), threw an uncaught
+            // length_error - a remote peer could kill any Mist HTTP client with
+            // a single malformed Content-Length header. Per RFC 9112, only
+            // decimal digits are valid (strtoull's "+1" is not), and an invalid
+            // or unrepresentable value is an unrecoverable framing error - it is
+            // exposed via hasFramingError() rather than silently reinterpreted.
             const std::string &clVal = GetHeader("Content-Length");
-            char *clEnd = 0;
-            unsigned long long clParsed = strtoull(clVal.c_str(), &clEnd, 10);
-            if (clEnd && !*clEnd && clVal.size() && clParsed <= 0xFFFFFFFFull){
+            uint64_t clParsed = 0;
+            bool clValid = clVal.size() > 0;
+            for (size_t ci = 0; clValid && ci < clVal.size(); ++ci){
+              if (clVal[ci] < '0' || clVal[ci] > '9'){clValid = false; break;}
+              uint64_t digit = clVal[ci] - '0';
+              if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clValid = false; break;}
+              clParsed = clParsed * 10 + digit;
+            }
+            if (clValid && clParsed <= (uint64_t)SIZE_MAX){
               length = clParsed;
               // reserve() is an optimization only: cap it so a large (but valid)
-              // length cannot force a huge upfront allocation either.
+              // length cannot force a huge upfront allocation.
               if (!bodyCallback && !onData && body.capacity() < length && length <= (16ull << 20)){
                 body.reserve(length);
               }
               knownLength = true;
+            }else{
+              framingError = true;
             }
           }
           if (GetHeader("Transfer-Encoding") == "chunked"){
@@ -664,7 +675,7 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
         if ((code >= 100 && code < 200) || code == 204 || code == 304){return true;}
       }
       if (knownLength && !getChunks){
-        unsigned int toappend = length - currentLength;
+        size_t toappend = length - currentLength;
 
         // limit the amount of bytes that will be appended to the amount there
         // is available

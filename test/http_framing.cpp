@@ -1,0 +1,94 @@
+// Framing-validation tests for HTTP::Parser's strict Content-Length handling
+// and the flags the connection-reuse logic depends on:
+//   - hasFramingError(): invalid or unrepresentable Content-Length (RFC 9112
+//     framing error; previously an atoi overflow here could throw an uncaught
+//     length_error from body.reserve() - a remote crash).
+//   - hasDuplicateContentLength(): case-insensitive duplicate detection that
+//     the case-sensitive header map cannot expose after parsing.
+// The parser only FLAGS these; emitting 400/close (servers) or discarding
+// (clients) stays the caller's responsibility.
+#include <cstdio>
+#include <mist/http_parser.h>
+#include <string>
+
+static int failures = 0;
+
+static void expect(bool cond, const char *what){
+  if (!cond){
+    printf("FAIL: %s\n", what);
+    ++failures;
+  }
+}
+
+int main(int argc, char **argv){
+  {
+    // Sanity: a normal message still parses, no flags raised.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    expect(P.Read(msg), "valid response parses to completion");
+    expect(!P.hasFramingError(), "valid response raises no framing error");
+    expect(!P.hasDuplicateContentLength(), "valid response raises no duplicate flag");
+    expect(P.body == "hello", "valid response body intact");
+  }
+  {
+    // "+1" is accepted by strtoull but is not a valid Content-Length (digits only).
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\nX";
+    P.Read(msg);
+    expect(P.hasFramingError(), "'+1' Content-Length flags a framing error");
+  }
+  {
+    // Trailing garbage.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 0x\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasFramingError(), "'0x' Content-Length flags a framing error");
+  }
+  {
+    // 20 digits: overflows uint64_t. Previously this was the remote-crash input.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasFramingError(), "overflowing Content-Length flags a framing error");
+  }
+  {
+    // A large but valid length (> 4 GiB) is representable on 64-bit targets:
+    // no framing error, message simply incomplete until that much body arrives.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 5000000000\r\n\r\n";
+    bool complete = P.Read(msg);
+    expect(!complete, ">4GiB response is incomplete without its body");
+    if (sizeof(size_t) >= 8){
+      expect(!P.hasFramingError(), ">4GiB Content-Length is valid on 64-bit targets");
+    }else{
+      expect(P.hasFramingError(), ">size_t Content-Length flags a framing error on 32-bit");
+    }
+  }
+  {
+    // The request path runs the same branch: a malformed request length flags too.
+    HTTP::Parser P;
+    std::string msg = "PUT /upload HTTP/1.1\r\nHost: x\r\nContent-Length: bogus\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasFramingError(), "malformed request Content-Length flags a framing error");
+  }
+  {
+    // Case-variant duplicates: the header map cannot show these after parsing.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasDuplicateContentLength(), "case-variant duplicate Content-Length is flagged");
+  }
+  {
+    // Clean() must reset both flags.
+    HTTP::Parser P;
+    std::string bad = "HTTP/1.1 200 OK\r\nContent-Length: 0x\r\ncontent-length: 1\r\n\r\n";
+    P.Read(bad);
+    expect(P.hasFramingError() && P.hasDuplicateContentLength(), "flags set before Clean");
+    P.Clean();
+    expect(!P.hasFramingError() && !P.hasDuplicateContentLength(), "Clean resets both flags");
+  }
+
+  if (failures){return 1;}
+  printf("OK: framing validation holds (%s-bit size_t)\n", sizeof(size_t) >= 8 ? "64" : "32");
+  return 0;
+}

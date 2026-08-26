@@ -39,6 +39,10 @@ test('persistent: empty Transfer-Encoding never reused', downloaderputtest, args
 test('persistent: descriptor swap forces reconnect', downloaderputtest, args: ['persistswap'], suite: 'Downloader PUT')
 test('socket counters cumulative and monotonic', downloaderputtest, args: ['statsmono'], suite: 'Downloader PUT')
 
+# Strict Content-Length framing validation and the reuse-safety flags.
+httpframingtest = executable('httpframingtest', 'http_framing.cpp', header_tgts, dependencies: libmist_dep)
+test('Content-Length framing validation', httpframingtest, suite: 'HTTP parser')
+
 # Session-token source for MIST_HLS_UNIQUE_SEGMENTS (unique segment naming).
 securerandomtest = executable('securerandomtest', 'secure_random.cpp', header_tgts, dependencies: libmist_dep)
 test('secure random hex: length, charset, distinctness', securerandomtest, suite: 'Secure random')

@@ -60,6 +60,13 @@ namespace HTTP{
     /// otherwise invisible to GetHeader-based validation. Connection-reuse logic
     /// must refuse such responses (framing/smuggling guard).
     bool hasDuplicateContentLength() const{return duplicateContentLength;}
+    /// True when the parsed message declared an invalid or unrepresentable
+    /// Content-Length (non-digits, or a value that does not fit size_t). Per
+    /// RFC 9112 this is an unrecoverable framing error: callers must not trust
+    /// the message boundary and must not reuse the connection. This parser does
+    /// not emit protocol responses itself, so acting on the error (400+close
+    /// for servers, discard for clients) is the caller's responsibility.
+    bool hasFramingError() const{return framingError;}
     void auth(const std::string &user, const std::string &pass, const std::string &authReq,
               const std::string &headerName = "Authorization");
     std::string body;
@@ -87,6 +94,7 @@ namespace HTTP{
     std::string read_buffer;
     bool duplicateContentLength = false; ///< See hasDuplicateContentLength()
     bool seenContentLengthHdr = false;   ///< Parse-time tracker for the above
+    bool framingError = false;           ///< See hasFramingError()
     std::map<std::string, std::string> headers;
     std::map<std::string, std::string> vars;
     void Trim(std::string &s);

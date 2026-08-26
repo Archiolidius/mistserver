@@ -438,7 +438,7 @@ namespace Util{
       if (putPersistActive() && gotResponse && result == PUT_FIN_OK_2XX && conn &&
           conn.getGeneration() == uploader->lastGeneration &&
           response.protocol == "HTTP/1.1" && !response.hasDuplicateContentLength() &&
-          !conn.Received().size()) {
+          !response.hasFramingError() && !conn.Received().size()) {
         std::string connHdr = response.GetHeader("Connection");
         Util::stringToLower(connHdr);
         bool closeRequested = connHdr.find("close") != std::string::npos;

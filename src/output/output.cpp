@@ -1716,7 +1716,9 @@ namespace Mist{
           // caller-supplied template is out of scope by decision; unique naming
           // is simply inactive for such targets, and saying so beats a silent
           // false activation log from the constructor.
-          if (targetParams.count("ytHlsPush") && getenv("MIST_HLS_UNIQUE_SEGMENTS") &&
+          const char *uniqEnv = getenv("MIST_HLS_UNIQUE_SEGMENTS");
+          bool uniqActive = uniqEnv && (!strcmp(uniqEnv, "1") || !strcasecmp(uniqEnv, "true"));
+          if (targetParams.count("ytHlsPush") && uniqActive &&
               targetParams["segment"] != tmpParams["segment"]){
             WARN_MSG("Custom segment= target replaces the session-token template: "
                      "MIST_HLS_UNIQUE_SEGMENTS is inactive for this target");
