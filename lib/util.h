@@ -35,8 +35,13 @@ namespace Util{
   PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint = "", uint64_t deadlineMS = 0);
   /// deadlineMS: optional absolute Util::bootMS() deadline for HTTP(S) targets; the
   /// effective PUT deadline is the earlier of this and the MIST_PUT_DEADLINE_MS budget.
-  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append = false, uint64_t deadlineMS = 0);
-  bool externalWriter(const std::string & file, Socket::Connection & conn, bool append = false);
+  // ytPushIdentity: set by the YouTube HLS push call sites only (the callers that
+  // know targetParams["ytHlsPush"]). When it and MIST_PUT_USER_AGENT are both set,
+  // HTTP(S) uploads carry the spec-format LiveReacting User-Agent. The defaulted
+  // parameter preserves every existing caller unchanged - generic uploads
+  // (MistUtilWriter, DTSC::Meta::toFile, raw H264 push, local files) never opt in.
+  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append = false, uint64_t deadlineMS = 0, bool ytPushIdentity = false);
+  bool externalWriter(const std::string & file, Socket::Connection & conn, bool append = false, bool ytPushIdentity = false);
 
   int64_t expBackoffMs(const size_t currIter, const size_t maxIter, const int64_t maxWait);
 

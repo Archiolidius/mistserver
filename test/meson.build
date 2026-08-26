@@ -23,6 +23,7 @@ test('no final response respects the deadline', downloaderputtest, args: ['quiet
 test('5xx at open retries in place', downloaderputtest, args: ['deny500retry'], suite: 'Downloader PUT')
 test('4xx at open fails immediately', downloaderputtest, args: ['deny403'], suite: 'Downloader PUT')
 test('silent server cannot hang the pusher', downloaderputtest, args: ['deadline'], suite: 'Downloader PUT')
+test('push User-Agent replaces by name, push-only', downloaderputtest, args: ['ua'], suite: 'Downloader PUT')
 
 # Session-token source for MIST_HLS_UNIQUE_SEGMENTS (unique segment naming).
 securerandomtest = executable('securerandomtest', 'secure_random.cpp', header_tgts, dependencies: libmist_dep)

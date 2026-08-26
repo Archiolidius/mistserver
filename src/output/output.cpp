@@ -1885,9 +1885,9 @@ namespace Mist{
             // recovery cannot cover this call; without a deadline (recovery enabled but
             // MIST_PUT_DEADLINE_MS unset) a stalled endpoint would block here forever.
             // Failure still returns 1 exactly as before - only the waiting is bounded.
-            Util::openNextUpload(playlistLocationString, plsConn, false, Util::bootMS() + plsRecoveryCapMS);
+            Util::openNextUpload(playlistLocationString, plsConn, false, Util::bootMS() + plsRecoveryCapMS, targetParams.count("ytHlsPush"));
           }else{
-            Util::externalWriter(playlistLocationString, plsConn);
+            Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"));
           }
           // Write initial contents to the playlist file
           if (!plsConn){
@@ -1929,7 +1929,7 @@ namespace Mist{
         INFO_MSG("Outputting %s to stdout with %s format", streamName.c_str(),
                  capa["name"].asString().c_str());
       }else{
-        if (!Util::externalWriter(newTarget, myConn, targetParams.count("append"))) {
+        if (!Util::externalWriter(newTarget, myConn, targetParams.count("append"), targetParams.count("ytHlsPush"))) {
           onFail("Could not connect to the target for recording", true);
           recEndTrigger();
           return 3;
@@ -2220,7 +2220,7 @@ namespace Mist{
                   // Reinit the playlist with the new targetDuration
                   uint64_t unixMs = M.packetTimeToUnixMs(currentStartTime, systemBoot);
                   reinitPlaylist(playlistBuffer, targetAge, maxEntries, segmentCount, segmentsRemoved, unixMs, targetDuration, playlistLocation);
-                  Util::externalWriter(playlistLocationString, plsConn);
+                  Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"));
                 }
                 // Else we are in a sliding window playlist, so it will automatically get overwritten
               }
@@ -2237,7 +2237,7 @@ namespace Mist{
                   playlistBuffer = "";
                 // Else re-open the file to force an overwrite
                 } else if (!plsRecovery) {
-                  if (Util::externalWriter(playlistLocationString, plsConn)) {
+                  if (Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"))) {
                     plsConn.SendNow(playlistBuffer);
                   }
                 } else {
@@ -2269,7 +2269,7 @@ namespace Mist{
                   // The remaining cap budget is threaded down as the PUT deadline, so a
                   // single open attempt can never overshoot the cap.
                   if (capReached()){break;}
-                  bool plsOpened = Util::openNextUpload(playlistLocationString, plsConn, false, capDeadline);
+                  bool plsOpened = Util::openNextUpload(playlistLocationString, plsConn, false, capDeadline, targetParams.count("ytHlsPush"));
                   if (plsOpened){
                     plsConn.SendNow(playlistBuffer);
                   }else{
@@ -2331,9 +2331,9 @@ namespace Mist{
               if (segFin == Util::PUT_FIN_PERMANENT){
                 WARN_MSG("Segment upload rejected (4xx) for `%s` - not counted as delivered", newTarget.c_str());
               }
-              segmentOpened = Util::openNextUpload(newTarget, myConn, false, lastPlaylistConfirmMS + plsRecoveryCapMS);
+              segmentOpened = Util::openNextUpload(newTarget, myConn, false, lastPlaylistConfirmMS + plsRecoveryCapMS, targetParams.count("ytHlsPush"));
             }else{
-              segmentOpened = Util::externalWriter(newTarget, myConn);
+              segmentOpened = Util::externalWriter(newTarget, myConn, false, targetParams.count("ytHlsPush"));
             }
             if (!segmentOpened) {
               if (!plsRecovery){
@@ -2392,7 +2392,7 @@ namespace Mist{
     // Write last segment
     if (targetParams.count("m3u8") && (firstPacketTime != 0xFFFFFFFFFFFFFFFFull) && (lastPacketTime - firstPacketTime > 0)){
       // If this is a non-live source, we can finally open up the connection to the playlist file
-      if (!M.getLive()) { Util::externalWriter(playlistLocationString, plsConn); }
+      if (!M.getLive()) { Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush")); }
       if (plsConn){
 
         if (lastPacketTime - currentStartTime > 0){
@@ -2438,7 +2438,7 @@ namespace Mist{
         if (!maxEntries && !targetAge) {
           plsConn.SendNow(playlistBuffer);
         // Else re-open the file to force an overwrite
-        } else if (Util::externalWriter(playlistLocationString, plsConn)) {
+        } else if (Util::externalWriter(playlistLocationString, plsConn, false, targetParams.count("ytHlsPush"))) {
           plsConn.SendNow(playlistBuffer);
         }
         // Finish the playlist chunk if needed

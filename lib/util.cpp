@@ -369,15 +369,15 @@ namespace Util{
   /// \param uri target URL or filepath
   /// \param outFile file descriptor which will be used to send data
   /// \param append whether to open this connection in truncate or append mode
-  bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append) {
+  bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append, bool ytPushIdentity) {
     // Send final chunk if in chunked mode (historical behavior: result ignored)
     finalizePreviousUpload(conn, uri);
-    return openNextUpload(uri, conn, append);
+    return openNextUpload(uri, conn, append, 0, ytPushIdentity);
   }
 
   /// \brief The "open" half of externalWriter: connects the given connection to a file
   /// or uploader binary without touching any previous upload state on it.
-  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append, uint64_t deadlineMS) {
+  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append, uint64_t deadlineMS, bool ytPushIdentity) {
     HTTP::URL target = HTTP::localURIResolver().link(uri);
 
     // Local paths just write to file
@@ -442,6 +442,27 @@ namespace Util{
       HIGH_MSG("Using native HTTP PUT handler with protocol %s", target.protocol.c_str());
       HTTP::Downloader dl;
       target = HTTP::injectHeaders(target, "PUT", dl);
+      // MIST_PUT_USER_AGENT: on YouTube HLS push uploads only (ytPushIdentity is set
+      // by exactly those call sites), identify LiveReacting in the User-Agent format
+      // YouTube's HLS ingest guide documents: "<manufacturer> / <model> / <version>".
+      // The switch picks between two fixed strings - env content never reaches the
+      // header. Off (the default) keeps today's identity everywhere.
+      static int8_t putUAMode = -1;
+      if (putUAMode < 0) {
+        putUAMode = 0;
+        const char *envUA = getenv("MIST_PUT_USER_AGENT");
+        if (envUA && *envUA) {
+          if (!strcmp(envUA, "1") || !strcasecmp(envUA, "true")) {
+            putUAMode = 1;
+            INFO_MSG("Push User-Agent override active: LiveReacting / MistServer / " PACKAGE_VERSION);
+          } else if (strcmp(envUA, "0") && strcasecmp(envUA, "false")) {
+            WARN_MSG("Ignoring MIST_PUT_USER_AGENT='%s' (use 1/true to enable)", envUA);
+          }
+        }
+      }
+      if (ytPushIdentity && putUAMode == 1) {
+        dl.setHeader("User-Agent", "LiveReacting / MistServer / " PACKAGE_VERSION);
+      }
       // Optional overall deadline for the whole PUT operation (connect, TLS handshake,
       // 100-continue wait, retries and backoff). MIST_PUT_DEADLINE_MS unset or 0 keeps
       // the legacy blocking behavior byte-for-byte. Values outside 1000-600000 ms, or

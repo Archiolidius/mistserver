@@ -40,6 +40,7 @@ namespace {
   std::vector<ServerBehavior> script;
   size_t served = 0;
   std::atomic<bool> stopServing(false);
+  std::vector<std::string> requestHeaders; ///< headers of each served request, script order (guarded by mut)
 
   /// Serves as many requests as the script has entries, one behavior each.
   void serving(){
@@ -79,6 +80,10 @@ namespace {
         }else{
           Util::sleep(5);
         }
+      }
+      {
+        std::lock_guard<std::mutex> g(mut);
+        requestHeaders.push_back(req);
       }
       if (behavior == NEVER_RESPOND){
         held.push_back(C);
@@ -127,6 +132,7 @@ namespace {
   bool startServer(const std::vector<ServerBehavior> &behaviors, std::thread &t, std::string &url){
     script = behaviors;
     served = 0;
+    requestHeaders.clear();
     stopServing = false;
     boundPort = 0;
     t = std::thread(serving);
@@ -169,15 +175,27 @@ namespace {
 
   /// Uploads one small chunk to the given URL, then finalizes it.
   /// Returns true when the open succeeded; reports the finalize classification.
-  bool uploadOnce(const std::string &url, uint64_t deadlineMS, Util::PutFinalizeResult &finResult){
+  bool uploadOnce(const std::string &url, uint64_t deadlineMS, Util::PutFinalizeResult &finResult, bool ytPushIdentity = false){
     Socket::Connection conn;
-    if (!Util::openNextUpload(url, conn, false, deadlineMS)){
+    if (!Util::openNextUpload(url, conn, false, deadlineMS, ytPushIdentity)){
       finResult = Util::PUT_FIN_NONE;
       return false;
     }
     conn.SendNow("hello", 5);
     finResult = Util::finalizePreviousUpload(conn, url, deadlineMS);
     return true;
+  }
+
+  std::string capturedHeaders(size_t idx){
+    std::lock_guard<std::mutex> g(mut);
+    if (idx >= requestHeaders.size()){return "";}
+    return requestHeaders[idx];
+  }
+
+  size_t countOf(const std::string &hay, const std::string &needle){
+    size_t n = 0, pos = 0;
+    while ((pos = hay.find(needle, pos)) != std::string::npos){++n; pos += needle.size();}
+    return n;
   }
 
 }// namespace
@@ -240,6 +258,34 @@ int main(int argc, char **argv){
     uint64_t spent = Util::bootMS() - start;
     if (ok && spent > 2000){
       ok = fail("4xx at open took " + std::to_string(spent) + "ms, expected an immediate failure");
+    }
+  }else if (testCase == "ua"){
+    // MIST_PUT_USER_AGENT with the ytPushIdentity opt-in must REPLACE the
+    // default User-Agent (by name, no duplicate header); without the opt-in
+    // the default identity stays even with the gate on. The replace-by-name
+    // behavior of extraHeaders is verified here rather than trusted.
+    setenv("MIST_PUT_USER_AGENT", "1", 1);
+    if (!startServer({ACCEPT_THEN_200, ACCEPT_THEN_200}, t, url)){return 1;}
+    Util::PutFinalizeResult r;
+    if (!uploadOnce(url, 0, r, true)){ok = fail("opted-in upload could not open");}
+    else{
+      std::string hdrs = capturedHeaders(0);
+      if (hdrs.find("User-Agent: LiveReacting / MistServer / ") == std::string::npos){
+        ok = fail("compliant identity missing from push upload headers: " + hdrs);
+      }else if (countOf(hdrs, "User-Agent:") != 1){
+        ok = fail("User-Agent duplicated instead of replaced: " + hdrs);
+      }
+    }
+    if (ok){
+      if (!uploadOnce(url, 0, r, false)){ok = fail("non-push upload could not open");}
+      else{
+        std::string hdrs = capturedHeaders(1);
+        if (hdrs.find("LiveReacting / MistServer") != std::string::npos){
+          ok = fail("non-push upload carried the push identity: " + hdrs);
+        }else if (hdrs.find("User-Agent: ") == std::string::npos){
+          ok = fail("non-push upload lost its User-Agent entirely: " + hdrs);
+        }
+      }
     }
   }else if (testCase == "deadline"){
     // A server that never answers must not hang the pusher: the open fails
