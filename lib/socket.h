@@ -185,7 +185,8 @@ namespace Socket{
     ~Connection();
     // generic methods
     void open(int sockNo); // Open from existing socket connection.
-    void open(std::string host, int port, bool nonblock, bool with_ssl = false, const std::string & hostname = ""); // Open TCP connection.
+    void open(std::string host, int port, bool nonblock, bool with_ssl = false, const std::string & hostname = "",
+              uint64_t deadlineMS = 0); // Open TCP connection. Optional absolute Util::bootMS() deadline (0 = legacy behavior).
     void open(std::string adres, bool nonblock = false); // Open Unix connection.
     void open(int write, int read);                      // Open from two existing file descriptors.
 #ifdef SSL

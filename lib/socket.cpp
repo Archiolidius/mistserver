@@ -1266,7 +1266,11 @@ Socket::Connection::Connection(std::string host, int port, bool nonblock, bool w
 
 /// Open TCP connection.
 /// Closes any existing connections and resets all internal values beforehand.
-void Socket::Connection::open(std::string host, int port, bool nonblock, bool with_ssl, const std::string & hostname) {
+/// Open TCP connection. When deadlineMS is nonzero it is an absolute Util::bootMS()
+/// deadline that bounds the TCP connect attempts and the TLS handshake; DNS resolution
+/// is a documented overshoot. deadlineMS == 0 keeps the legacy behavior byte-for-byte.
+void Socket::Connection::open(std::string host, int port, bool nonblock, bool with_ssl, const std::string & hostname,
+                              uint64_t deadlineMS) {
   drop();
   clear();
   if (with_ssl){
@@ -1312,6 +1316,10 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
 
   lastErr = "";
   for (rp = result; rp; rp = rp->ai_next){
+    if (deadlineMS && Util::bootMS() >= deadlineMS){
+      lastErr += "connect deadline expired";
+      break;
+    }
     sSend = socket(rp->ai_family, SOCK_STREAM, rp->ai_protocol);
     if (sSend < 0){continue;}
     setFDBlocking(sSend, false);
@@ -1326,6 +1334,10 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
     sockErr = errno;
     size_t waitTime = 5;
     while (ret && sockErr == EINPROGRESS && waitTime){
+      if (deadlineMS && Util::bootMS() >= deadlineMS){
+        waitTime = 0; // treat as connect timeout
+        break;
+      }
       struct timeval timeout;
       timeout.tv_sec = 1;
       timeout.tv_usec = 0;
@@ -1410,6 +1422,39 @@ void Socket::Connection::open(std::string host, int port, bool nonblock, bool wi
       return;
     }
     mbedtls_ssl_set_bio(ssl, server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+    if (deadlineMS){
+      // Deadline-aware handshake: force the fd nonblocking so mbedtls returns
+      // WANT_READ/WANT_WRITE instead of blocking inside read(), then poll for
+      // readiness between handshake steps, bounded by the deadline.
+      setFDBlocking(server_fd->fd, false);
+      while ((ret = mbedtls_ssl_handshake(ssl)) != 0){
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE){
+          char estr[200];
+          mbedtls_strerror(ret, estr, 200);
+          lastErr = estr;
+          FAIL_MSG("SSL handshake error %d: %s", ret, lastErr.c_str());
+          close();
+          return;
+        }
+        uint64_t nowMS = Util::bootMS();
+        if (nowMS >= deadlineMS){
+          lastErr = "TLS handshake deadline expired";
+          FAIL_MSG("SSL handshake error: deadline expired connecting to %s", host.c_str());
+          close();
+          return;
+        }
+        struct pollfd pfd;
+        pfd.fd = server_fd->fd;
+        pfd.events = (ret == MBEDTLS_ERR_SSL_WANT_WRITE) ? POLLOUT : POLLIN;
+        pfd.revents = 0;
+        uint64_t remain = deadlineMS - nowMS;
+        poll(&pfd, 1, remain > 100 ? 100 : (int)remain);
+      }
+      sslConnected = true;
+      setBlocking(!nonblock); // restore the requested blocking mode via the SSL fd path
+      DONTEVEN_MSG("SSL connect success");
+      return;
+    }
     while ((ret = mbedtls_ssl_handshake(ssl)) != 0){
       if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE){
         char estr[200];

@@ -392,7 +392,18 @@ namespace Util{
       HIGH_MSG("Using native HTTP PUT handler with protocol %s", target.protocol.c_str());
       HTTP::Downloader dl;
       target = HTTP::injectHeaders(target, "PUT", dl);
-      if (!dl.startPut(target, conn)) { return false; }
+      // Optional overall deadline for the whole PUT operation (connect, TLS handshake,
+      // 100-continue wait, retries and backoff). MIST_PUT_DEADLINE_MS unset or 0 keeps
+      // the legacy blocking behavior byte-for-byte.
+      static int64_t putBudgetMS = -1;
+      if (putBudgetMS < 0) {
+        const char *envBudget = getenv("MIST_PUT_DEADLINE_MS");
+        putBudgetMS = envBudget ? atoll(envBudget) : 0;
+        if (putBudgetMS < 0) { putBudgetMS = 0; }
+        if (putBudgetMS) { INFO_MSG("PUT deadline mode active: %" PRId64 " ms budget per upload", putBudgetMS); }
+      }
+      uint64_t putDeadline = putBudgetMS ? Util::bootMS() + putBudgetMS : 0;
+      if (!dl.startPut(target, conn, 6, putDeadline)) { return false; }
       return true;
     }
     ERROR_MSG("Could not connect to '%s', since we do not have a configured external writer to "
