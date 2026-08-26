@@ -12,6 +12,7 @@
 #include <mist/timing.h>
 #include <mist/util.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
@@ -38,7 +39,7 @@ namespace {
   Socket::Server srv;
   std::vector<ServerBehavior> script;
   size_t served = 0;
-  bool stopServing = false;
+  std::atomic<bool> stopServing(false);
 
   /// Serves as many requests as the script has entries, one behavior each.
   void serving(){
@@ -131,14 +132,22 @@ namespace {
     t = std::thread(serving);
     std::unique_lock<std::mutex> g(mut);
     cv.wait(g, [](){return boundPort != 0;});
-    if (boundPort == -1){return false;}
+    if (boundPort == -1){
+      g.unlock();
+      // Never destroy a joinable thread: that calls std::terminate. The serving
+      // thread has already returned in this path, so the join is immediate.
+      stopServing = true;
+      if (t.joinable()){t.join();}
+      return false;
+    }
     url = "http://127.0.0.1:" + std::to_string(boundPort) + "/upload";
     return true;
   }
 
+  /// The serving thread owns srv and closes it on exit; main only raises the flag.
+  /// Closing a socket from another thread while accept() may be using it is a race.
   void stopServer(std::thread &t){
     stopServing = true;
-    srv.close();
     if (t.joinable()){t.join();}
   }
 
@@ -210,7 +219,8 @@ int main(int argc, char **argv){
     if (!uploadOnce(url, deadline, r)){ok = fail("upload could not open");}
     else if (r != Util::PUT_FIN_NO_RESPONSE){ok = fail(std::string("silence classified as ") + finName(r));}
     uint64_t spent = Util::bootMS() - start;
-    if (ok && spent > 3000){
+    // 1.5 s deadline plus one 1 s ev.await tick, plus slack for a loaded CI box.
+    if (ok && spent > 4000){
       ok = fail("finalize ignored the deadline, took " + std::to_string(spent) + "ms");
     }
   }else if (testCase == "deny500retry"){
@@ -239,7 +249,7 @@ int main(int argc, char **argv){
     Util::PutFinalizeResult r;
     if (uploadOnce(url, start + 3000, r)){ok = fail("silent server reported a successful open");}
     uint64_t spent = Util::bootMS() - start;
-    if (ok && spent > 8000){
+    if (ok && spent > 4500){
       ok = fail("open blocked " + std::to_string(spent) + "ms past a 3000ms deadline");
     }
     if (ok){std::cerr << "gave up after " << spent << "ms" << std::endl;}

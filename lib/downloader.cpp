@@ -694,11 +694,17 @@ namespace HTTP{
             INFO_MSG("Server denied PUT request for %s: %s (open %" PRIu64 " ms, %" PRIu64 " ms wait)",
                      link.getUrl().c_str(), line.c_str(), openMs, Util::bootMS() - waitStart);
             conn.close();
-            // With an overall deadline, a 5xx denial is transient: retry in place within
-            // budget. Any other denial (4xx) is permanent and fails immediately.
-            if (deadlineMS && sp1 != std::string::npos && line.size() > sp1 + 1 && line[sp1 + 1] == '5') {
-              retryAttempt = true;
-              break;
+            // With an overall deadline, a transient denial retries in place within budget.
+            // Transient means the same set the final-response classifier uses: any 5xx,
+            // plus 408 (timeout) and 429 (rate limited). Treating those two differently
+            // here than at finalize would be incoherent - the server is telling us to come
+            // back, not that the request is invalid. Any other denial fails immediately.
+            if (deadlineMS && sp1 != std::string::npos && sp2 != std::string::npos && sp2 > sp1) {
+              std::string code = line.substr(sp1 + 1, sp2 - sp1 - 1);
+              if ((code.size() && code[0] == '5') || code == "408" || code == "429") {
+                retryAttempt = true;
+                break;
+              }
             }
             return false;
           }

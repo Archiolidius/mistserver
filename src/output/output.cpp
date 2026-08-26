@@ -1737,8 +1737,18 @@ namespace Mist{
       addEndlist = false;
     }
     if (targetParams.count("ytHlsPush")){
-      const char *envRecovery = getenv("MIST_PLAYLIST_RECOVERY");
-      plsRecovery = envRecovery && atoll(envRecovery);
+      if (const char *envRecovery = getenv("MIST_PLAYLIST_RECOVERY")){
+        // Accept the obvious spellings, not just "1": silently leaving the feature off
+        // because someone wrote "true" is the kind of surprise that costs an outage to
+        // diagnose. Anything unrecognised warns instead of failing quietly.
+        std::string val(envRecovery);
+        Util::stringToLower(val);
+        if (val == "1" || val == "true" || val == "yes" || val == "on"){
+          plsRecovery = true;
+        }else if (val.size() && val != "0" && val != "false" && val != "no" && val != "off"){
+          WARN_MSG("Ignoring MIST_PLAYLIST_RECOVERY='%s' (expected 1/0, true/false, yes/no, on/off)", envRecovery);
+        }
+      }
       if (plsRecovery){
         INFO_MSG("Playlist recovery mode active (cap: %" PRIu64 " ms without a confirmed write)", plsRecoveryCapMS);
       }
@@ -1870,7 +1880,15 @@ namespace Mist{
         }
         // Do not open the playlist just yet if this is a non-live source
         if (M.getLive()){
-          Util::externalWriter(playlistLocationString, plsConn);
+          if (plsRecovery){
+            // Bound the very first open too. The failure clock has no baseline yet, so
+            // recovery cannot cover this call; without a deadline (recovery enabled but
+            // MIST_PUT_DEADLINE_MS unset) a stalled endpoint would block here forever.
+            // Failure still returns 1 exactly as before - only the waiting is bounded.
+            Util::openNextUpload(playlistLocationString, plsConn, false, Util::bootMS() + plsRecoveryCapMS);
+          }else{
+            Util::externalWriter(playlistLocationString, plsConn);
+          }
           // Write initial contents to the playlist file
           if (!plsConn){
             FAIL_MSG("Failed to open a connection to playlist file `%s` for segmenting", playlistLocationString.c_str());
@@ -2292,10 +2310,15 @@ namespace Mist{
               // Same split as the playlist site: finalize (bounded by the remaining cap
               // budget), then open with that budget threaded down as the PUT deadline.
               Util::PutFinalizeResult segFin = Util::finalizePreviousUpload(myConn, newTarget, lastPlaylistConfirmMS + plsRecoveryCapMS);
-              // Recorded now, read at the next boundary. NONE means there was nothing to
-              // finalize (first cycle, or the previous open failed) and is not evidence
-              // of a rejection, so it does not count against the clock here.
-              prevCycleSegmentSentOk = (segFin != Util::PUT_FIN_TRANSIENT);
+              // Recorded now, read at the next boundary, and derived from the SAME segment
+              // this finalize belongs to: prevCycleSegmentOpenOk still holds that segment's
+              // open result here (it is updated further down). Requiring positive evidence
+              // rather than "not transient" matters, because a segment discarded to
+              // /dev/null finalizes as NONE - treating that as success would let a stream
+              // that alternates failed opens with rejected bodies reset the clock forever
+              // and never reach the cap.
+              prevCycleSegmentSentOk = prevCycleSegmentOpenOk &&
+                                       (segFin == Util::PUT_FIN_OK_2XX || segFin == Util::PUT_FIN_NO_RESPONSE);
               if (segFin == Util::PUT_FIN_PERMANENT){
                 FAIL_MSG("Segment upload permanently rejected for `%s` - stopping push", newTarget.c_str());
                 Util::logExitReason(ER_WRITE_FAILURE, "segment upload permanently rejected (4xx): %s", newTarget.c_str());

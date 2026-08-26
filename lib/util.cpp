@@ -295,7 +295,12 @@ namespace Util{
   /// historical externalWriter behavior; the classification is returned instead of
   /// being discarded.
   PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint, uint64_t deadlineMS) {
-    if (!conn || !conn.isChunkedMode()) { return PUT_FIN_NONE; }
+    // A connection still in chunked mode had an upload in flight. If it is already dead,
+    // the peer killed that upload (a body write detected the drop) - report it as the
+    // transient failure it was, not as "nothing to finalize", so callers tracking
+    // delivery evidence are not told a lost segment succeeded.
+    if (!conn) { return conn.isChunkedMode() ? PUT_FIN_TRANSIENT : PUT_FIN_NONE; }
+    if (!conn.isChunkedMode()) { return PUT_FIN_NONE; }
     uint64_t finalizeStart = Util::bootMS();
     conn.SendNow(0, 0);
     HTTP::Parser response;
@@ -304,6 +309,13 @@ namespace Util{
     Event::Loop ev;
     auto attemptFinish = [&]() {
       if (response.Read(conn)) {
+        // An informational 1xx (e.g. "102 Processing") is not a verdict: the real final
+        // response is still coming. Accepting it as the outcome would classify a healthy
+        // upload as failed and, in recovery mode, count it against the failure clock.
+        if (response.url.size() && response.url[0] == '1') {
+          response.Clean();
+          return;
+        }
         uint64_t finalizeMs = Util::bootMS() - finalizeStart;
         // Record the final status of every completed upload (observability only; callers decide what to do)
         if (response.url.size() && response.url[0] == '2') {
