@@ -447,9 +447,10 @@ namespace Util{
           conn.getGeneration() == uploader->lastGeneration &&
           response.protocol == "HTTP/1.1" && !response.hasDuplicateContentLength() &&
           !response.hasFramingError() && !conn.Received().size()) {
-        std::string connHdr = response.GetHeader("Connection");
-        Util::stringToLower(connHdr);
-        bool closeRequested = connHdr.find("close") != std::string::npos;
+        // Parse-time flag, not GetHeader: duplicate Connection fields (case
+        // variants, or a later same-name field overwriting an earlier one) can
+        // hide a "close" token from the map. The flag saw every field as parsed.
+        bool closeRequested = response.hasConnectionClose();
         bool lengthDelimited = false;
         // hasHeader, not the value: an empty "Transfer-Encoding:" header is still
         // a Transfer-Encoding header and must disqualify (fail closed).

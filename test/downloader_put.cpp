@@ -41,6 +41,7 @@ namespace {
     KEEP_200_DUPCL,   ///< 200 with two Content-Length headers (case variants), kept open
     KEEP_200_SPACECL, ///< 200 with "Content-Length : 5" (space before colon) plus "Content-Length: 0", kept open
     KEEP_200_THEN_GARBAGE,///< 200 with Content-Length: 0, then unsolicited garbage bytes, kept open
+    KEEP_200_HIDDENCLOSE,///< 200 with "connection: close" hidden behind "Connection: keep-alive", kept open
     KEEP_200_THEN_DROP,///< 200 kept open, then the server closes it (idle-close)
     KEEP_204,          ///< 204 No Content (no body headers at all), kept open
     KEEP_200_CLOSEDELIM,///< 200 with no framing headers, delimited by close
@@ -154,6 +155,7 @@ namespace {
         case KEEP_200_DUPCL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n"); break;
         case KEEP_200_SPACECL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length : 5\r\nContent-Length: 0\r\n\r\n"); break;
         case KEEP_200_THEN_GARBAGE: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); Util::sleep(300); C.SendNow("BOGUS\r\n"); break;
+        case KEEP_200_HIDDENCLOSE: C.SendNow("HTTP/1.1 200 OK\r\nconnection: close\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"); break;
         case KEEP_200_THEN_DROP: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); Util::sleep(50); keepConn = false; break;
         case KEEP_204: C.SendNow("HTTP/1.1 204 No Content\r\n\r\n"); break;
         case KEEP_200_CLOSEDELIM: C.SendNow("HTTP/1.1 200 OK\r\n\r\n"); Util::sleep(50); keepConn = false; break;
@@ -469,6 +471,25 @@ int main(int argc, char **argv){
       Util::finalizePreviousUpload(conn, url, 0, &pu);
       conn.close();
       if (acceptCount != 2){ok = fail("space-before-colon duplicate Content-Length must forbid reuse, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persisthiddenclose"){
+    // A "close" token buried behind a case-variant duplicate Connection header:
+    // exact-match-first GetHeader sees only "keep-alive", so only the parse-time
+    // flag can refuse. The server keeps the socket open, so a wrong reuse would
+    // succeed and make acceptCount 1.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_HIDDENCLOSE, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("hidden Connection: close must forbid reuse, server saw " + std::to_string(acceptCount) + " accepts");}
     }
   }else if (testCase == "persistdesync"){
     // Unsolicited bytes arriving AFTER a connection was certified for reuse:

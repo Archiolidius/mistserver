@@ -71,6 +71,13 @@ namespace HTTP{
     /// check this flag and refuse; the parser does not emit protocol responses
     /// itself.
     bool hasFramingError() const{return framingError;}
+    /// True when ANY Connection header field of the parsed message carried a
+    /// "close" token (case-insensitive, any case combination of the name).
+    /// GetHeader cannot answer this: the case-sensitive map hides case-variant
+    /// duplicates behind exact-match-first lookup, and same-case duplicates
+    /// overwrite - either can bury a "close" the peer did send. Connection-reuse
+    /// logic must refuse when this is set.
+    bool hasConnectionClose() const{return connectionClose;}
     void auth(const std::string &user, const std::string &pass, const std::string &authReq,
               const std::string &headerName = "Authorization");
     std::string body;
@@ -99,6 +106,7 @@ namespace HTTP{
     bool duplicateContentLength = false; ///< See hasDuplicateContentLength()
     bool seenContentLengthHdr = false;   ///< Parse-time tracker for the above
     bool framingError = false;           ///< See hasFramingError()
+    bool connectionClose = false;        ///< See hasConnectionClose()
     std::map<std::string, std::string> headers;
     std::map<std::string, std::string> vars;
     void Trim(std::string &s);

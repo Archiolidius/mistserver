@@ -129,13 +129,36 @@ int main(int argc, char **argv){
     expect(P.hasDuplicateContentLength(), "space-before-colon duplicate Content-Length is flagged");
   }
   {
-    // Clean() must reset both flags.
+    // A "close" token in ANY Connection field must be visible, even when a
+    // case-variant duplicate hides it from exact-match-first GetHeader.
     HTTP::Parser P;
-    std::string bad = "HTTP/1.1 200 OK\r\nContent-Length: 0x\r\ncontent-length: 1\r\n\r\n";
+    std::string msg = "HTTP/1.1 200 OK\r\nconnection: close\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasConnectionClose(), "'close' hidden behind a case-variant duplicate is still flagged");
+  }
+  {
+    // Same-case duplicates overwrite in the map: the earlier "close" would be
+    // gone from GetHeader entirely. The parse-time flag must still hold it.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nConnection: close\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasConnectionClose(), "'close' overwritten by a later same-name field is still flagged");
+  }
+  {
+    // Plain keep-alive must NOT flag.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    P.Read(msg);
+    expect(!P.hasConnectionClose(), "keep-alive alone does not flag connection close");
+  }
+  {
+    // Clean() must reset all flags.
+    HTTP::Parser P;
+    std::string bad = "HTTP/1.1 200 OK\r\nContent-Length: 0x\r\ncontent-length: 1\r\nConnection: close\r\n\r\n";
     P.Read(bad);
-    expect(P.hasFramingError() && P.hasDuplicateContentLength(), "flags set before Clean");
+    expect(P.hasFramingError() && P.hasDuplicateContentLength() && P.hasConnectionClose(), "flags set before Clean");
     P.Clean();
-    expect(!P.hasFramingError() && !P.hasDuplicateContentLength(), "Clean resets both flags");
+    expect(!P.hasFramingError() && !P.hasDuplicateContentLength() && !P.hasConnectionClose(), "Clean resets all flags");
   }
 
   if (failures){return 1;}

@@ -37,6 +37,7 @@ void HTTP::Parser::CleanPreserveHeaders(){
   duplicateContentLength = false;
   seenContentLengthHdr = false;
   framingError = false;
+  connectionClose = false;
   seenHeaders = false;
   seenReq = false;
   possiblyComplete = false;
@@ -696,18 +697,29 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           tmpB = tmpA.substr(0, f);
           tmpC = tmpA.substr(f + 1);
           {
-            // Case-insensitive duplicate tracking for the framing-critical
-            // Content-Length header; see hasDuplicateContentLength().
-            // Trimmed FIRST, exactly like SetHeader trims the map key: a name
-            // written "Content-Length : 5" collapses into the same map entry as
-            // "Content-Length: 0", so an untrimmed comparison here would let
-            // that pair through as a non-duplicate.
+            // Parse-time tracking for the two connection-reuse-critical headers.
+            // The header map is case-sensitive with overwrite-on-set, so after
+            // parsing it cannot show duplicates, case variants, or an earlier
+            // value a later same-name field replaced - only seeing each field
+            // AS PARSED can. Names are trimmed FIRST, exactly like SetHeader
+            // trims the map key: "Content-Length : 5" collapses into the same
+            // map entry as "Content-Length: 0", so an untrimmed comparison
+            // would let that pair through as a non-duplicate.
             std::string lowered = tmpB;
             Trim(lowered);
             for (size_t li = 0; li < lowered.size(); ++li){lowered[li] = tolower(lowered[li]);}
             if (lowered == "content-length"){
+              // See hasDuplicateContentLength().
               if (seenContentLengthHdr){duplicateContentLength = true;}
               seenContentLengthHdr = true;
+            }else if (lowered == "connection"){
+              // See hasConnectionClose(): a "close" token in ANY Connection
+              // field counts, even when another field (case-variant duplicate,
+              // or a later same-name overwrite) would hide it from GetHeader.
+              std::string val = tmpC;
+              Trim(val);
+              for (size_t li = 0; li < val.size(); ++li){val[li] = tolower(val[li]);}
+              if (val.find("close") != std::string::npos){connectionClose = true;}
             }
           }
           SetHeader(tmpB, tmpC);

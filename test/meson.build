@@ -33,6 +33,7 @@ test('persistent: duplicate Content-Length never reused', downloaderputtest, arg
 test('persistent: idle-close reconnects transparently', downloaderputtest, args: ['persistidle'], suite: 'Downloader PUT')
 test('persistent: 204 without explicit length never reused', downloaderputtest, args: ['persist204'], suite: 'Downloader PUT')
 test('persistent: space-colon duplicate Content-Length never reused', downloaderputtest, args: ['persistspacecl'], suite: 'Downloader PUT')
+test('persistent: hidden Connection close never reused', downloaderputtest, args: ['persisthiddenclose'], suite: 'Downloader PUT')
 test('persistent: stale bytes abort cleanly, no desync', downloaderputtest, args: ['persistdesync'], suite: 'Downloader PUT')
 test('persistent: close-delimited never reused', downloaderputtest, args: ['persistclosedelim'], suite: 'Downloader PUT')
 test('persistent: garbage Content-Length never reused', downloaderputtest, args: ['persistbadcl'], suite: 'Downloader PUT')
