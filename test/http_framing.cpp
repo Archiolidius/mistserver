@@ -55,6 +55,23 @@ int main(int argc, char **argv){
     expect(complete && P.body == "hello", "'5, 5' frames as 5 (legacy numeric prefix)");
   }
   {
+    // "-0": atoi framed it as 0 without a crash, so the fallback must too.
+    // Only negative NONZERO values were the crash class.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: -0\r\n\r\n";
+    bool complete = P.Read(msg);
+    expect(P.hasFramingError(), "'-0' Content-Length flags a framing error");
+    expect(complete && P.body.empty(), "'-0' frames as 0 (legacy atoi result)");
+  }
+  {
+    // "-5": negative nonzero was the crash class on the base code (sign-extended
+    // into a huge size_t, uncaught length_error from reserve): length-unknown.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasFramingError(), "'-5' Content-Length flags a framing error");
+  }
+  {
     // An EMPTY Content-Length header is present but invalid: must flag.
     HTTP::Parser P;
     std::string msg = "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n";

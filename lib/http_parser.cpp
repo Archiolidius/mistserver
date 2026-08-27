@@ -633,30 +633,50 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
             //    That class has no behavior to preserve; it stays length-unknown.
             const std::string &clVal = GetHeader("Content-Length");
             uint64_t clParsed = 0;
-            bool clStrict = clVal.size() > 0;
-            for (size_t ci = 0; clStrict && ci < clVal.size(); ++ci){
-              if (clVal[ci] < '0' || clVal[ci] > '9'){clStrict = false; break;}
+            bool clDigitsOnly = clVal.size() > 0;
+            for (size_t ci = 0; clDigitsOnly && ci < clVal.size(); ++ci){
+              if (clVal[ci] < '0' || clVal[ci] > '9'){clDigitsOnly = false; break;}
               uint64_t digit = clVal[ci] - '0';
-              if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clStrict = false; break;}
+              if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clDigitsOnly = false; break;}
               clParsed = clParsed * 10 + digit;
             }
-            if (!clStrict){
+            bool clUsable = clDigitsOnly;
+            if (clDigitsOnly){
+              // Strictly valid value. Above INT_MAX the base atoi was a lottery
+              // of crash and misframe (int truncation: 3000000000 crashed,
+              // 4294967296 framed as 0) - correct framing is the fix, not a
+              // compatibility break. Unrepresentable on this platform (32-bit
+              // size_t) still flags: the value is valid but cannot be handled.
+              if (clParsed > (uint64_t)SIZE_MAX){
+                framingError = true;
+                clUsable = false;
+              }
+            }else{
               framingError = true;
-              // Legacy-compatible framing fallback: the leading numeric prefix,
-              // exactly as atoi read it (SetHeader already trimmed whitespace).
+              // Legacy-compatible framing fallback for RFC-invalid values: the
+              // leading numeric prefix, exactly as atoi read it (SetHeader
+              // already trimmed whitespace; "5, 5" frames as 5, "0x" as 0, "-0"
+              // as 0). Only the crash class - a negative NONZERO value or an
+              // overflowing prefix, which sign-extended/overflowed into a huge
+              // size_t and threw an uncaught length_error out of body.reserve()
+              // - stays length-unknown: it has no non-crash behavior to keep.
               clParsed = 0;
-              bool clUsable = clVal.size() > 0; // empty stayed length-unknown before too
+              clUsable = clVal.size() > 0; // empty stayed length-unknown before too
+              bool clNegative = false;
               size_t ci = 0;
-              if (clUsable && clVal[ci] == '+'){++ci;}
-              else if (clUsable && clVal[ci] == '-'){clUsable = false;}// crash class on the base code
+              if (clUsable && (clVal[ci] == '+' || clVal[ci] == '-')){
+                clNegative = (clVal[ci] == '-');
+                ++ci;
+              }
               for (; clUsable && ci < clVal.size() && clVal[ci] >= '0' && clVal[ci] <= '9'; ++ci){
                 uint64_t digit = clVal[ci] - '0';
                 if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clUsable = false; break;}// crash class
                 clParsed = clParsed * 10 + digit;
               }
-              clStrict = clUsable;
+              if (clNegative && clParsed){clUsable = false;}// crash class; "-0" framed as 0 without one
+              if (clParsed > (uint64_t)SIZE_MAX){clUsable = false;}
             }
-            if (clStrict && clParsed <= (uint64_t)SIZE_MAX){
+            if (clUsable){
               length = clParsed;
               // reserve() is an optimization only: cap it so a large (but valid)
               // length cannot force a huge upfront allocation.
