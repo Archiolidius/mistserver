@@ -37,8 +37,10 @@ namespace {
     // cases: answer and KEEP the connection open for a next request.
     KEEP_200,         ///< 200 with Content-Length: 0, connection kept open
     KEEP_200_CHUNKED, ///< 200 with a chunked (zero-chunk) final response, kept open
-    KEEP_200_CLOSEHDR,///< 200 with "Connection: close", then actually close
+    KEEP_200_CLOSEHDR,///< 200 with "Connection: close" but the socket KEPT OPEN: proves the header check itself
     KEEP_200_DUPCL,   ///< 200 with two Content-Length headers (case variants), kept open
+    KEEP_200_SPACECL, ///< 200 with "Content-Length : 5" (space before colon) plus "Content-Length: 0", kept open
+    KEEP_200_THEN_GARBAGE,///< 200 with Content-Length: 0, then unsolicited garbage bytes, kept open
     KEEP_200_THEN_DROP,///< 200 kept open, then the server closes it (idle-close)
     KEEP_204,          ///< 204 No Content (no body headers at all), kept open
     KEEP_200_CLOSEDELIM,///< 200 with no framing headers, delimited by close
@@ -148,8 +150,10 @@ namespace {
         case ACCEPT_THEN_500: C.SendNow("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); keepConn = false; break;
         case KEEP_200: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); break;
         case KEEP_200_CHUNKED: C.SendNow("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"); break;
-        case KEEP_200_CLOSEHDR: C.SendNow("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"); keepConn = false; break;
+        case KEEP_200_CLOSEHDR: C.SendNow("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"); break;
         case KEEP_200_DUPCL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n"); break;
+        case KEEP_200_SPACECL: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length : 5\r\nContent-Length: 0\r\n\r\n"); break;
+        case KEEP_200_THEN_GARBAGE: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); Util::sleep(300); C.SendNow("BOGUS\r\n"); break;
         case KEEP_200_THEN_DROP: C.SendNow("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); Util::sleep(50); keepConn = false; break;
         case KEEP_204: C.SendNow("HTTP/1.1 204 No Content\r\n\r\n"); break;
         case KEEP_200_CLOSEDELIM: C.SendNow("HTTP/1.1 200 OK\r\n\r\n"); Util::sleep(50); keepConn = false; break;
@@ -267,6 +271,12 @@ int main(int argc, char **argv){
     return 1;
   }
   std::string testCase = argv[1];
+  // Hermetic env: an ambient MIST_PUT_* in a dev or CI shell must not leak into
+  // the legacy cases or make the gate-off cases false-fail. Each persistent
+  // case sets exactly what it needs below.
+  unsetenv("MIST_PUT_DEADLINE_MS");
+  unsetenv("MIST_PUT_PERSISTENT");
+  unsetenv("MIST_PUT_USER_AGENT");
   std::thread t;
   std::string url;
   bool ok = true;
@@ -422,7 +432,10 @@ int main(int argc, char **argv){
       if (acceptCount != 2){ok = fail("duplicate Content-Length must forbid reuse, server saw " + std::to_string(acceptCount) + " accepts");}
     }
   }else if (testCase == "persist204"){
-    // A 204 final response is length-delimited by definition: reusable.
+    // A 204 without an explicit Content-Length: 0 must NOT be reused: the
+    // parser returns at a 204's header end before any body validation, so a
+    // malformed 204 with a delayed body would desync the next response. The
+    // gate accepts exactly one shape - explicit Content-Length: 0.
     setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
     setenv("MIST_PUT_PERSISTENT", "1", 1);
     if (!startServer({KEEP_204, KEEP_204}, t, url)){return 1;}
@@ -436,7 +449,51 @@ int main(int argc, char **argv){
     if (ok){
       Util::finalizePreviousUpload(conn, url, 0, &pu);
       conn.close();
-      if (acceptCount != 1){ok = fail("204 must be reusable, server saw " + std::to_string(acceptCount) + " accepts");}
+      if (acceptCount != 2){ok = fail("204 without Content-Length: 0 must not be reused, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistspacecl"){
+    // "Content-Length : 5" (space before the colon) collapses into the same
+    // trimmed map key as "Content-Length: 0", so only the parse-time duplicate
+    // tracker can see the conflict - and it must, or a certified reuse would
+    // read the 5 declared body bytes as the next response.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_SPACECL, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    for (int i = 0; ok && i < 2; ++i){
+      if (!uploadCycle(url, conn, pu, r)){ok = fail("upload could not open");}
+    }
+    if (ok){
+      Util::finalizePreviousUpload(conn, url, 0, &pu);
+      conn.close();
+      if (acceptCount != 2){ok = fail("space-before-colon duplicate Content-Length must forbid reuse, server saw " + std::to_string(acceptCount) + " accepts");}
+    }
+  }else if (testCase == "persistdesync"){
+    // Unsolicited bytes arriving AFTER a connection was certified for reuse:
+    // the next request must abort cleanly (the stale line reads as a denial)
+    // instead of attributing any later response to the wrong request. Bounded
+    // loss - one failed open - is the contract; desync is the bug.
+    setenv("MIST_PUT_DEADLINE_MS", "3000", 1);
+    setenv("MIST_PUT_PERSISTENT", "1", 1);
+    if (!startServer({KEEP_200_THEN_GARBAGE, KEEP_200}, t, url)){return 1;}
+    Socket::Connection conn;
+    Util::PersistentUploader pu;
+    Util::PutFinalizeResult r;
+    if (!uploadCycle(url, conn, pu, r)){ok = fail("first upload could not open");}
+    if (ok){
+      r = Util::finalizePreviousUpload(conn, url, 0, &pu); // certifies before the garbage lands
+      if (r != Util::PUT_FIN_OK_2XX){ok = fail(std::string("clean 200 classified as ") + finName(r));}
+    }
+    if (ok){
+      Util::sleep(600); // let the unsolicited bytes reach our socket
+      if (Util::openNextUpload(url, conn, false, 0, false, &pu)){
+        ok = fail("stale unsolicited bytes did not abort the reused request");
+        Util::finalizePreviousUpload(conn, url, 0, &pu);
+      }
+      conn.close();
+      if (ok && acceptCount != 1){ok = fail("expected no reconnect before the abort, server saw " + std::to_string(acceptCount) + " accepts");}
     }
   }else if (testCase == "persistclosedelim"){
     // A close-delimited response (no framing headers) is complete only when the
@@ -549,7 +606,16 @@ int main(int argc, char **argv){
       if (devNull < 0){ok = fail("could not open /dev/null");}
       else{
         conn.open(devNull); // generation bump: no longer the certified connection
+        // Time-bound the reconnect: the generation gate closes the swapped
+        // descriptor BEFORE the request, so the fresh connect is immediate.
+        // Without the gate the request would go into /dev/null first and only
+        // recover through the retry backoff (>=300 ms) - so a fast open is the
+        // observable proof the gate (not the fallback) did the work.
+        uint64_t swapStart = Util::bootMS();
         if (!Util::openNextUpload(url, conn, false, 0, false, &pu)){ok = fail("post-swap upload could not open");}
+        else if (Util::bootMS() - swapStart > 250){
+          ok = fail("post-swap open took " + std::to_string(Util::bootMS() - swapStart) + "ms: retry fallback, not the generation gate");
+        }
         else{
           conn.SendNow("hello", 5);
           if (Util::finalizePreviousUpload(conn, url, 0, &pu) != Util::PUT_FIN_OK_2XX){
@@ -561,40 +627,28 @@ int main(int argc, char **argv){
       if (ok && acceptCount != 2){ok = fail("descriptor swap must force reconnect, server saw " + std::to_string(acceptCount) + " accepts");}
     }
   }else if (testCase == "statsmono"){
-    // Socket::Connection counters must be cumulative and monotonic across
-    // reconnects of one object (stats consumers treat decreases as errors),
-    // connTime() must keep reporting the first connect, and resetCounter()
-    // must still zero everything.
+    // Socket::Connection statistics keep their historical per-connection
+    // semantics everywhere (counters reset on reopen, exactly as before this
+    // branch), and the reconnect generation - the reuse identity - changes on
+    // every reopen and never resets.
     // drop() closes the previous descriptor, so every reopen needs a fresh fd.
     int fd1 = open("/dev/null", O_WRONLY);
     int fd2 = open("/dev/null", O_WRONLY);
-    int fd3 = open("/dev/null", O_WRONLY);
-    int fd4 = open("/dev/null", O_WRONLY);
-    if (fd1 < 0 || fd2 < 0 || fd3 < 0 || fd4 < 0){ok = fail("could not open /dev/null");}
+    if (fd1 < 0 || fd2 < 0){ok = fail("could not open /dev/null");}
     else{
-      // Default (no opt-in): historical semantics must be byte-identical -
-      // counters reset on reopen, exactly as before this change.
-      Socket::Connection legacyC(fd1, fd1);
-      legacyC.SendNow("0123456789", 10);
-      legacyC.open(fd2, fd2);
-      if (legacyC.dataUp() != 0){ok = fail("legacy semantics changed: dataUp kept bytes without opt-in");}
-      legacyC.close();
-      // Opt-in: cumulative and monotonic across reconnects.
-      Socket::Connection c(fd3, fd3);
-      c.setLifetimeTotals(true);
+      Socket::Connection c(fd1, fd1);
       c.SendNow("0123456789", 10);
-      uint64_t upFirst = c.dataUp();
-      unsigned int t0 = c.connTime();
+      if (c.dataUp() != 10){ok = fail("dataUp did not count sent bytes");}
       uint64_t genFirst = c.getGeneration();
-      c.open(fd4, fd4); // reconnect: legacy counters would reset here
-      if (c.getGeneration() == genFirst){ok = fail("generation did not change on reopen");}
+      c.open(fd2, fd2); // reopen: historical semantics reset the counters
+      if (ok && c.dataUp() != 0){ok = fail("historical semantics changed: dataUp kept bytes across reopen");}
+      if (ok && c.getGeneration() == genFirst){ok = fail("generation did not change on reopen");}
       c.SendNow("0123456789", 10);
-      if (ok && c.dataUp() < upFirst + 10){
-        ok = fail("dataUp lost bytes across reopen: " + std::to_string(c.dataUp()));
-      }
-      if (ok && c.connTime() > t0){ok = fail("connTime moved forward across reopen");}
       c.resetCounter();
       if (ok && c.dataUp() != 0){ok = fail("resetCounter no longer zeroes dataUp");}
+      uint64_t genBeforeReset = c.getGeneration();
+      c.resetCounter();
+      if (ok && c.getGeneration() != genBeforeReset){ok = fail("resetCounter must not touch the generation");}
       c.close();
     }
   }else if (testCase == "ua"){

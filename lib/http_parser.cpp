@@ -658,7 +658,12 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           {
             // Case-insensitive duplicate tracking for the framing-critical
             // Content-Length header; see hasDuplicateContentLength().
+            // Trimmed FIRST, exactly like SetHeader trims the map key: a name
+            // written "Content-Length : 5" collapses into the same map entry as
+            // "Content-Length: 0", so an untrimmed comparison here would let
+            // that pair through as a non-duplicate.
             std::string lowered = tmpB;
+            Trim(lowered);
             for (size_t li = 0; li < lowered.size(); ++li){lowered[li] = tolower(lowered[li]);}
             if (lowered == "content-length"){
               if (seenContentLengthHdr){duplicateContentLength = true;}

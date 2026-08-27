@@ -340,9 +340,17 @@ namespace Util{
     return mode == 1;
   }
 
-  PersistentUploader::PersistentUploader() : dl(new HTTP::Downloader()) {}
+  // The Downloader is created on first use, not in the constructor: uploaders
+  // are declared unconditionally in Output::run() for every output process, and
+  // only the persistent HTTP(S) push path ever calls downloader(). Eager
+  // construction would cost every RTMP/RTSP/WebSocket session an allocation and
+  // an http_proxy getenv/log for a feature it never touches.
+  PersistentUploader::PersistentUploader() : dl(0) {}
   PersistentUploader::~PersistentUploader() { delete dl; }
-  HTTP::Downloader &PersistentUploader::downloader() { return *dl; }
+  HTTP::Downloader &PersistentUploader::downloader() {
+    if (!dl) { dl = new HTTP::Downloader(); }
+    return *dl;
+  }
 
   /// \brief Finalizes the previous chunked upload on the given connection, if any.
   /// Sends the final zero chunk, waits up to 5 s for the server's final response,
@@ -447,16 +455,15 @@ namespace Util{
         // a Transfer-Encoding header and must disqualify (fail closed).
         if (!response.hasHeader("Transfer-Encoding")) {
           const std::string &cl = response.GetHeader("Content-Length");
-          if (response.url.size() >= 3 && response.url.substr(0, 3) == "204") {
-            lengthDelimited = true;
-          } else if (cl == "0") {
-            // Maximally fail-closed: only an explicit zero-length body qualifies.
-            // A nonzero Content-Length would rely on the shared parser's atoi
-            // (overflow-prone) having consumed the body exactly; refusing reuse
-            // there costs nothing - YouTube's ingest answers Content-Length: 0
-            // (measured 2026-08-26) - and removes the whole class of
-            // wrong-boundary reuse. Trailing garbage ("0x") fails the exact
-            // string compare by construction.
+          if (cl == "0") {
+            // Maximally fail-closed: ONLY an explicit zero-length body qualifies,
+            // 204 included - the parser returns at a 204's header end before any
+            // body validation runs, so a malformed "204 + Content-Length: 5 +
+            // delayed body" would pass every other check here and desync the
+            // next response. A nonzero Content-Length is refused for the same
+            // reason. Refusing costs nothing: YouTube's ingest answers
+            // Content-Length: 0 (measured 2026-08-26). Trailing garbage ("0x")
+            // fails the exact string compare by construction.
             lengthDelimited = true;
           }
         }
@@ -554,12 +561,6 @@ namespace Util{
       // Downloader (the non-persistent path) has empty state, so prepareRequest
       // reconnects - exactly the legacy behavior.
       HTTP::Downloader &dl = persist ? uploader->downloader() : localDl;
-      if (persist) {
-        // Cumulative statistics across our deliberate reconnects (opt-in so that
-        // with the gate off every Connection reader stays byte-identical to the
-        // historical behavior for all other outputs).
-        conn.setLifetimeTotals(true);
-      }
       if (persist && conn &&
           !(uploader->reusable && conn.getGeneration() == uploader->lastGeneration)) {
         // Not eligible for reuse: force a fresh connection. Without this,

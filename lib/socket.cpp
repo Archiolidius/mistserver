@@ -1021,17 +1021,6 @@ Socket::Connection::Connection(){
 void Socket::Connection::resetCounter(){
   up = 0;
   down = 0;
-  // A deliberate reset clears the lifetime accumulators too - otherwise this
-  // method would silently stop resetting for callers once reconnect folding
-  // exists. The generation is intentionally NOT reset: identity must never
-  // repeat within an object's lifetime.
-  lifeUp = 0;
-  lifeDown = 0;
-  sessionStart = 0;
-}
-
-void Socket::Connection::setLifetimeTotals(bool track){
-  lifetimeTotals = track;
 }
 
 void Socket::Connection::addUp(const uint32_t i){
@@ -1074,25 +1063,9 @@ void Socket::Connection::close(){
 /// This function does *not* call shutdown, allowing continued use in other
 /// processes.
 void Socket::Connection::drop(){
-  // With lifetime totals enabled (persistent uploads only), fold the ending
-  // connection's counters into the object-lifetime accumulators BEFORE anything
-  // clears them, so dataUp()/dataDown() stay cumulative and monotonic across
-  // reconnects (including ones performed inside callees, e.g. Downloader retry
-  // loops) and connTime() keeps reporting the first connect. Guarded on the
-  // socket having actually been open: open() itself starts with drop(), and an
-  // unguarded capture would record a placeholder object's construction time as
-  // its connect time. Off (the default) leaves every reader byte-identical to
-  // the historical behavior. resetCounter() is the one deliberate full reset.
-  // The generation bump is unconditional: it has no reader-visible semantics,
-  // and reuse identity must work before any opt-in. Spurious bumps from
-  // dropping an already-closed connection are harmless (only equality is used).
-  if (lifetimeTotals && (sSend != -1 || sRecv != -1)){
-    lifeUp += up;
-    lifeDown += down;
-    up = 0;
-    down = 0;
-    if (!sessionStart){sessionStart = conntime;}
-  }
+  // Reconnect-generation bump. It has no reader-visible semantics beyond
+  // getGeneration() equality (reuse identity), and spurious bumps from dropping
+  // an already-closed connection are harmless - only exact matches are used.
   ++generation;
   upBuffer.clear();
 #ifdef SSL
@@ -1581,23 +1554,18 @@ bool Socket::Connection::connected() const{
 }
 
 /// Returns the time this socket has been connected.
-/// With lifetime totals enabled, reports the FIRST connect of this object once
-/// any reconnect happened, so elapsed-time consumers (now - connTime()) never
-/// see time move backwards. Historical per-connection value otherwise.
 unsigned int Socket::Connection::connTime(){
-  return (lifetimeTotals && sessionStart) ? sessionStart : conntime;
+  return conntime;
 }
 
-/// Returns total amount of bytes sent (cumulative across reconnects when
-/// lifetime totals are enabled; historical per-connection value otherwise).
+/// Returns total amount of bytes sent.
 uint64_t Socket::Connection::dataUp(){
-  return lifetimeTotals ? lifeUp + up : up;
+  return up;
 }
 
-/// Returns total amount of bytes received (cumulative across reconnects when
-/// lifetime totals are enabled; historical per-connection value otherwise).
+/// Returns total amount of bytes received.
 uint64_t Socket::Connection::dataDown(){
-  return lifetimeTotals ? lifeDown + down : down;
+  return down;
 }
 
 /// Reconnect generation: bumped on every drop(). Reuse logic records the value

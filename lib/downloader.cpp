@@ -686,8 +686,9 @@ namespace HTTP{
               conn.Received().clear();
               // In deadline mode the socket was opened nonblocking for the connect,
               // handshake and 100-continue phases. Return it to blocking so the body
-              // phase behaves exactly like the legacy path. Known gap until persistent
-              // connections land: a mid-body hang is not covered by the deadline.
+              // phase behaves exactly like the legacy path. Known gap (also with
+              // MIST_PUT_PERSISTENT): a mid-body hang against a blackholed peer is
+              // not covered by the deadline - identical to the legacy behavior.
               if (deadlineMS) { conn.setBlocking(true); }
               return true;
             }

@@ -1713,15 +1713,19 @@ namespace Mist{
         if (tmpParams.count("segment")){
           // A custom segment= template replaces the constructor's, including any
           // MIST_HLS_UNIQUE_SEGMENTS session token it carried. Rewriting a
-          // caller-supplied template is out of scope by decision; unique naming
-          // is simply inactive for such targets, and saying so beats a silent
-          // false activation log from the constructor.
+          // caller-supplied template is out of scope by decision, so on a
+          // YouTube push with the uniqueness switch set this refuses to start
+          // (fail closed, same policy as the no-secure-random path): a warning
+          // alone would let a restart silently resend previously used names.
           const char *uniqEnv = getenv("MIST_HLS_UNIQUE_SEGMENTS");
           bool uniqActive = uniqEnv && (!strcmp(uniqEnv, "1") || !strcasecmp(uniqEnv, "true"));
           if (targetParams.count("ytHlsPush") && uniqActive &&
               targetParams["segment"] != tmpParams["segment"]){
-            WARN_MSG("Custom segment= target replaces the session-token template: "
-                     "MIST_HLS_UNIQUE_SEGMENTS is inactive for this target");
+            FAIL_MSG("MIST_HLS_UNIQUE_SEGMENTS is set but a custom segment= target would drop "
+                     "the session token - refusing to start this push");
+            Util::logExitReason(ER_FORMAT_SPECIFIC,
+                                "MIST_HLS_UNIQUE_SEGMENTS set but a custom segment= target would drop the session token");
+            return 1;
           }
           targetParams["segment"] = tmpParams["segment"];
         }

@@ -86,6 +86,15 @@ int main(int argc, char **argv){
     expect(P.hasDuplicateContentLength(), "case-variant duplicate Content-Length is flagged");
   }
   {
+    // Space before the colon: SetHeader trims the name, so both fields collapse
+    // into one map key. The duplicate tracker must trim the same way, or this
+    // conflicting pair would read as a single clean Content-Length: 0.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length : 5\r\nContent-Length: 0\r\n\r\n";
+    P.Read(msg);
+    expect(P.hasDuplicateContentLength(), "space-before-colon duplicate Content-Length is flagged");
+  }
+  {
     // Clean() must reset both flags.
     HTTP::Parser P;
     std::string bad = "HTTP/1.1 200 OK\r\nContent-Length: 0x\r\ncontent-length: 1\r\n\r\n";
