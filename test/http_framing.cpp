@@ -1,12 +1,16 @@
-// Framing-validation tests for HTTP::Parser's strict Content-Length handling
-// and the flags the connection-reuse logic depends on:
-//   - hasFramingError(): invalid or unrepresentable Content-Length (RFC 9112
-//     framing error; previously an atoi overflow here could throw an uncaught
-//     length_error from body.reserve() - a remote crash).
-//   - hasDuplicateContentLength(): case-insensitive duplicate detection that
-//     the case-sensitive header map cannot expose after parsing.
-// The parser only FLAGS these; emitting 400/close (servers) or discarding
-// (clients) stays the caller's responsibility.
+// Framing-validation tests for HTTP::Parser's Content-Length handling and the
+// flags the connection-reuse logic depends on:
+//   - hasFramingError(): the value is not strictly valid per RFC 9112 (digits
+//     only, fits size_t). Message FRAMING deliberately keeps the legacy
+//     numeric-prefix semantics atoi provided ("5, 5" frames as 5), so every
+//     existing server and client behaves as before; only the crash class
+//     (negative/overflow, which previously threw an uncaught length_error from
+//     body.reserve() - a remote crash) stays length-unknown.
+//   - hasDuplicateContentLength(): case-insensitive duplicate detection (header
+//     name trimmed like SetHeader trims it) that the case-sensitive header map
+//     cannot expose after parsing.
+// The parser only FLAGS strictness violations; refusing reuse, or emitting
+// 400/close from servers, stays the caller's responsibility.
 #include <cstdio>
 #include <mist/http_parser.h>
 #include <string>
@@ -31,11 +35,24 @@ int main(int argc, char **argv){
     expect(P.body == "hello", "valid response body intact");
   }
   {
-    // "+1" is accepted by strtoull but is not a valid Content-Length (digits only).
+    // "+1" is not strictly valid (digits only), so it flags - but it must still
+    // FRAME exactly as atoi framed it (one body byte), keeping every legacy
+    // caller's behavior unchanged.
     HTTP::Parser P;
     std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\nX";
-    P.Read(msg);
+    bool complete = P.Read(msg);
     expect(P.hasFramingError(), "'+1' Content-Length flags a framing error");
+    expect(complete, "'+1' still completes with its one body byte (legacy framing)");
+    expect(P.body == "X", "'+1' frames one body byte exactly as atoi did");
+  }
+  {
+    // Comma-separated identical list, the classic proxy-merged shape: flags
+    // (not strictly valid) but frames as 5, byte-identical to the atoi era.
+    HTTP::Parser P;
+    std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello";
+    bool complete = P.Read(msg);
+    expect(P.hasFramingError(), "'5, 5' Content-Length flags a framing error");
+    expect(complete && P.body == "hello", "'5, 5' frames as 5 (legacy numeric prefix)");
   }
   {
     // An EMPTY Content-Length header is present but invalid: must flag.

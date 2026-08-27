@@ -616,25 +616,47 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           body.clear();
           knownLength = false;
           if (hasHeader("Content-Length")){
-            // hasHeader, not a value check: an EMPTY Content-Length header is
-            // present-but-invalid and must flag, not silently bypass validation.
-            // Strict manual parse, not atoi: atoi overflow on an oversized value
-            // is undefined and, fed into body.reserve(), threw an uncaught
-            // length_error - a remote peer could kill any Mist HTTP client with
-            // a single malformed Content-Length header. Per RFC 9112, only
-            // decimal digits are valid (strtoull's "+1" is not), and an invalid
-            // or unrepresentable value is an unrecoverable framing error - it is
-            // exposed via hasFramingError() rather than silently reinterpreted.
+            // Two separate concerns, deliberately decoupled:
+            // 1) STRICT validation (RFC 9112: decimal digits only, representable
+            //    in size_t) feeds hasFramingError(). The connection-reuse gate -
+            //    and any future 400-emitting server enforcement - refuses on it.
+            //    hasHeader, not a value check: an EMPTY Content-Length header is
+            //    present-but-invalid and must flag.
+            // 2) MESSAGE FRAMING keeps the legacy numeric-prefix semantics that
+            //    atoi provided here for two decades ("5, 5" frames as 5, "0x" as
+            //    0), so every server and client in the codebase behaves
+            //    byte-identically to before for any input that did not crash.
+            //    The one legacy behavior NOT preserved is the crash class: atoi
+            //    overflow (or a negative value) sign-extended into a huge size_t
+            //    and body.reserve() threw an uncaught length_error - a remote
+            //    peer could kill any Mist HTTP client or server with one header.
+            //    That class has no behavior to preserve; it stays length-unknown.
             const std::string &clVal = GetHeader("Content-Length");
             uint64_t clParsed = 0;
-            bool clValid = clVal.size() > 0;
-            for (size_t ci = 0; clValid && ci < clVal.size(); ++ci){
-              if (clVal[ci] < '0' || clVal[ci] > '9'){clValid = false; break;}
+            bool clStrict = clVal.size() > 0;
+            for (size_t ci = 0; clStrict && ci < clVal.size(); ++ci){
+              if (clVal[ci] < '0' || clVal[ci] > '9'){clStrict = false; break;}
               uint64_t digit = clVal[ci] - '0';
-              if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clValid = false; break;}
+              if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clStrict = false; break;}
               clParsed = clParsed * 10 + digit;
             }
-            if (clValid && clParsed <= (uint64_t)SIZE_MAX){
+            if (!clStrict){
+              framingError = true;
+              // Legacy-compatible framing fallback: the leading numeric prefix,
+              // exactly as atoi read it (SetHeader already trimmed whitespace).
+              clParsed = 0;
+              bool clUsable = clVal.size() > 0; // empty stayed length-unknown before too
+              size_t ci = 0;
+              if (clUsable && clVal[ci] == '+'){++ci;}
+              else if (clUsable && clVal[ci] == '-'){clUsable = false;}// crash class on the base code
+              for (; clUsable && ci < clVal.size() && clVal[ci] >= '0' && clVal[ci] <= '9'; ++ci){
+                uint64_t digit = clVal[ci] - '0';
+                if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clUsable = false; break;}// crash class
+                clParsed = clParsed * 10 + digit;
+              }
+              clStrict = clUsable;
+            }
+            if (clStrict && clParsed <= (uint64_t)SIZE_MAX){
               length = clParsed;
               // reserve() is an optimization only: cap it so a large (but valid)
               // length cannot force a huge upfront allocation.
@@ -642,8 +664,6 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
                 body.reserve(length);
               }
               knownLength = true;
-            }else{
-              framingError = true;
             }
           }
           if (GetHeader("Transfer-Encoding") == "chunked"){
