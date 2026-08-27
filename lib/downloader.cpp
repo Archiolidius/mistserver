@@ -100,8 +100,11 @@ namespace HTTP{
     S.close();
   }
 
-  /// Prepares a request for the given URL, does not send anything
-  void Downloader::prepareRequest(const HTTP::URL & link, const std::string & method, Socket::Connection & conn) {
+  /// Prepares a request for the given URL, does not send anything.
+  /// When deadlineMS is nonzero, the socket is opened nonblocking with that absolute
+  /// Util::bootMS() deadline bounding connect and TLS handshake (0 = legacy behavior).
+  void Downloader::prepareRequest(const HTTP::URL & link, const std::string & method, Socket::Connection & conn,
+                                  uint64_t deadlineMS) {
     if (!canRequest(link)){return;}
     bool needSSL = (link.protocol == "https" || link.protocol == "wss");
     H.Clean();
@@ -113,9 +116,9 @@ namespace HTTP{
         connectedHost = link.host;
         connectedPort = link.getPort();
 #ifdef SSL
-        conn.open(connectedHost, connectedPort, !nbBlocking, needSSL);
+        conn.open(connectedHost, connectedPort, deadlineMS ? true : !nbBlocking, needSSL, "", deadlineMS);
 #else
-        conn.open(connectedHost, connectedPort, !nbBlocking);
+        conn.open(connectedHost, connectedPort, deadlineMS ? true : !nbBlocking, false, "", deadlineMS);
 #endif
       }
     }else{
@@ -124,7 +127,7 @@ namespace HTTP{
         conn.Received().clear();
         connectedHost = proxyUrl.host;
         connectedPort = proxyUrl.getPort();
-        conn.open(connectedHost, connectedPort, !nbBlocking);
+        conn.open(connectedHost, connectedPort, deadlineMS ? true : !nbBlocking, false, "", deadlineMS);
       }
     }
     ssl = needSSL;
@@ -604,25 +607,60 @@ namespace HTTP{
     return false;
   }
 
-  bool Downloader::startPut(const HTTP::URL & link, Socket::Connection & conn, uint8_t maxRecursiveDepth) {
+  /// Briefly waits before a PUT retry: jittered 300-800 ms, never sleeping past the
+  /// given absolute deadline (Util::bootMS() clock). Jitter is random per call so
+  /// parallel pushers to the same host do not retry in lockstep.
+  static void putRetryDelay(uint64_t deadlineMS) {
+    uint16_t rnd = 0;
+    Util::getRandomBytes(&rnd, sizeof(rnd));
+    uint64_t delay = 300 + (rnd % 500);
+    if (deadlineMS) {
+      uint64_t nowMS = Util::bootMS();
+      if (nowMS >= deadlineMS) { return; }
+      if (nowMS + delay > deadlineMS) { delay = deadlineMS - nowMS; }
+    }
+    Util::sleep(delay);
+  }
+
+  bool Downloader::startPut(const HTTP::URL & link, Socket::Connection & conn, uint8_t maxRecursiveDepth, uint64_t deadlineMS) {
     if (!canRequest(link)) { return false; }
     nbBlocking = true;
     size_t loop = 0;
     while (++loop <= retryCount) { // loop while we are unsuccessful
+      if (deadlineMS && Util::bootMS() >= deadlineMS) {
+        WARN_MSG("PUT deadline exhausted after %zu attempt(s) for %s", loop - 1, link.getUrl().c_str());
+        return false;
+      }
       MEDIUM_MSG("PUTting to %s (%zu/%" PRIu32 ")", link.getUrl().c_str(), loop, retryCount);
       setHeader("X-Attempt", std::to_string(loop));
-      prepareRequest(link, "PUT", conn);
-      if (!conn) { continue; } // No connection? Retry up to retryCount times.
+      uint64_t attemptStart = Util::bootMS();
+      prepareRequest(link, "PUT", conn, deadlineMS);
+      if (!conn) { // No connection? Retry up to retryCount times.
+        if (deadlineMS) { putRetryDelay(deadlineMS); }
+        continue;
+      }
+      uint64_t openMs = Util::bootMS() - attemptStart; // time spent on connect + TLS handshake
       conn.setChunkedMode(false);
       H.SetHeader("Expect", "100-continue");
       H.SetHeader("Transfer-Encoding", "chunked");
       H.sendRequest(conn);
       H.Clean();
       conn.setChunkedMode(true);
+      // In deadline mode the socket is nonblocking; if the request headers could not
+      // even reach the kernel buffer, treat it as a transient failure and retry.
+      if (deadlineMS && conn.sendingBlocked(1)) {
+        conn.close();
+        putRetryDelay(deadlineMS);
+        continue;
+      }
       Event::Loop ev;
       ev.addSocket(1, conn.getSocket());
       uint64_t now = Util::bootMS();
+      uint64_t waitStart = now;
+      // 5 s wait per attempt for the 100-continue; the overall deadline additionally caps it.
       uint64_t deadLine = now + 5000;
+      if (deadlineMS && deadlineMS < deadLine) { deadLine = deadlineMS; }
+      bool retryAttempt = false;
       while (true) {
         bool atLeastOnce = true;
         while (conn.spool() || atLeastOnce) {
@@ -643,24 +681,52 @@ namespace HTTP{
             size_t sp1 = line.find(' ');
             size_t sp2 = line.find(' ', sp1 + 1);
             if (sp1 != std::string::npos && sp2 != std::string::npos && line.substr(sp1 + 1, sp2 - sp1 - 1) == "100") {
-              INFO_MSG("Server approved PUT request for %s: %s", link.getUrl().c_str(), line.c_str() + sp2 + 1);
+              INFO_MSG("Server approved PUT request for %s: %s (open %" PRIu64 " ms, 100-continue %" PRIu64 " ms)",
+                       link.getUrl().c_str(), line.c_str() + sp2 + 1, openMs, Util::bootMS() - waitStart);
               conn.Received().clear();
+              // In deadline mode the socket was opened nonblocking for the connect,
+              // handshake and 100-continue phases. Return it to blocking so the body
+              // phase behaves exactly like the legacy path. Known gap (also with
+              // MIST_PUT_PERSISTENT): a mid-body hang against a blackholed peer is
+              // not covered by the deadline - identical to the legacy behavior.
+              if (deadlineMS) { conn.setBlocking(true); }
               return true;
             }
-            INFO_MSG("Server denied PUT request for %s: %s", link.getUrl().c_str(), line.c_str());
+            INFO_MSG("Server denied PUT request for %s: %s (open %" PRIu64 " ms, %" PRIu64 " ms wait)",
+                     link.getUrl().c_str(), line.c_str(), openMs, Util::bootMS() - waitStart);
             conn.close();
+            // With an overall deadline, a transient denial retries in place within budget.
+            // Transient means the same set the final-response classifier uses: any 5xx,
+            // plus 408 (timeout) and 429 (rate limited). Treating those two differently
+            // here than at finalize would be incoherent - the server is telling us to come
+            // back, not that the request is invalid. Any other denial fails immediately.
+            if (deadlineMS && sp1 != std::string::npos && sp2 != std::string::npos && sp2 > sp1) {
+              std::string code = line.substr(sp1 + 1, sp2 - sp1 - 1);
+              if ((code.size() && code[0] == '5') || code == "408" || code == "429") {
+                retryAttempt = true;
+                break;
+              }
+            }
             return false;
           }
         }
+        if (retryAttempt) { break; }
         now = Util::bootMS();
         if (now >= deadLine || !conn) {
-          WARN_MSG("No response to PUT request from server for %s", link.getUrl().c_str());
+          WARN_MSG("No response to PUT request from server for %s (%s, open %" PRIu64 " ms, waited %" PRIu64 " ms)",
+                   link.getUrl().c_str(), conn ? "timeout" : "connection lost", openMs, now - waitStart);
           conn.close();
-          return false;
+          // Without a deadline this is fatal for the whole operation (legacy behavior).
+          if (!deadlineMS) { return false; }
+          retryAttempt = true;
+          break;
         }
         ev.await(std::min(deadLine - now, (uint64_t)1000));
       }
+      // Only reached on a transient failure in deadline mode: back off briefly, then retry.
+      putRetryDelay(deadlineMS);
     }
+    if (deadlineMS) { WARN_MSG("PUT to %s gave up after %zu attempt(s)", link.getUrl().c_str(), loop - 1); }
     return false;
   }
 

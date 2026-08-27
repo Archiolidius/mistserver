@@ -13,6 +13,43 @@ downloadertest = executable('downloadertest', 'downloader.cpp', header_tgts, dep
 test('event-looped non-blocking', downloadertest, args: ['AUTO'], env: {'EVENTLOOP':'1'}, suite: 'Downloader')
 test('blocking', downloadertest, args: ['AUTO'], suite: 'Downloader')
 
+# Chunked-PUT upload path (used by HLS push targets): 100-continue handling,
+# deadline and retry policy in startPut, final-status classification in
+# Util::finalizePreviousUpload.
+downloaderputtest = executable('downloaderputtest', 'downloader_put.cpp', header_tgts, dependencies: libmist_dep)
+test('final 2xx and 4xx classification', downloaderputtest, args: ['ok403'], suite: 'Downloader PUT')
+test('final 5xx is transient', downloaderputtest, args: ['500'], suite: 'Downloader PUT')
+test('no final response respects the deadline', downloaderputtest, args: ['quiet'], suite: 'Downloader PUT')
+test('5xx at open retries in place', downloaderputtest, args: ['deny500retry'], suite: 'Downloader PUT')
+test('4xx at open fails immediately', downloaderputtest, args: ['deny403'], suite: 'Downloader PUT')
+test('silent server cannot hang the pusher', downloaderputtest, args: ['deadline'], suite: 'Downloader PUT')
+test('push User-Agent replaces by name, push-only', downloaderputtest, args: ['ua'], suite: 'Downloader PUT')
+test('persistent: reuse across uploads', downloaderputtest, args: ['persist'], suite: 'Downloader PUT')
+test('persistent: gate off reconnects per upload', downloaderputtest, args: ['persistoff'], suite: 'Downloader PUT')
+test('persistent: inert without the deadline', downloaderputtest, args: ['persistnodeadline'], suite: 'Downloader PUT')
+test('persistent: chunked response never reused', downloaderputtest, args: ['persistchunked'], suite: 'Downloader PUT')
+test('persistent: Connection close never reused', downloaderputtest, args: ['persistclose'], suite: 'Downloader PUT')
+test('persistent: duplicate Content-Length never reused', downloaderputtest, args: ['persistdupcl'], suite: 'Downloader PUT')
+test('persistent: idle-close reconnects transparently', downloaderputtest, args: ['persistidle'], suite: 'Downloader PUT')
+test('persistent: 204 without explicit length never reused', downloaderputtest, args: ['persist204'], suite: 'Downloader PUT')
+test('persistent: space-colon duplicate Content-Length never reused', downloaderputtest, args: ['persistspacecl'], suite: 'Downloader PUT')
+test('persistent: hidden Connection close never reused', downloaderputtest, args: ['persisthiddenclose'], suite: 'Downloader PUT')
+test('persistent: stale bytes abort cleanly, no desync', downloaderputtest, args: ['persistdesync'], suite: 'Downloader PUT')
+test('persistent: close-delimited never reused', downloaderputtest, args: ['persistclosedelim'], suite: 'Downloader PUT')
+test('persistent: garbage Content-Length never reused', downloaderputtest, args: ['persistbadcl'], suite: 'Downloader PUT')
+test('persistent: oversized Content-Length never reused', downloaderputtest, args: ['persistbigcl'], suite: 'Downloader PUT')
+test('persistent: empty Transfer-Encoding never reused', downloaderputtest, args: ['persistemptyte'], suite: 'Downloader PUT')
+test('persistent: descriptor swap forces reconnect', downloaderputtest, args: ['persistswap'], suite: 'Downloader PUT')
+test('socket counters keep historical semantics', downloaderputtest, args: ['statsmono'], suite: 'Downloader PUT')
+
+# Strict Content-Length framing validation and the reuse-safety flags.
+httpframingtest = executable('httpframingtest', 'http_framing.cpp', header_tgts, dependencies: libmist_dep)
+test('Content-Length framing validation', httpframingtest, suite: 'HTTP parser')
+
+# Session-token source for MIST_HLS_UNIQUE_SEGMENTS (unique segment naming).
+securerandomtest = executable('securerandomtest', 'secure_random.cpp', header_tgts, dependencies: libmist_dep)
+test('secure random hex: length, charset, distinctness', securerandomtest, suite: 'Secure random')
+
 
 # The only argument is simply the 'alg' parameter value as defined in the JWA spec (RFC7518)
 jwttest = executable('jwttest', 'jwt.cpp', header_tgts, dependencies: libmist_dep)

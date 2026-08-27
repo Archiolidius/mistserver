@@ -54,6 +54,30 @@ namespace HTTP{
     void Proxy(Socket::Connection &from, Socket::Connection &to);
     void Clean();
     void CleanPreserveHeaders();
+    /// True when the parsed message carried Content-Length more than once, in any
+    /// case combination. The headers map is case-sensitive and SetHeader
+    /// overwrites, so duplicate or case-variant Content-Length fields are
+    /// otherwise invisible to GetHeader-based validation. Connection-reuse logic
+    /// must refuse such responses (framing/smuggling guard).
+    bool hasDuplicateContentLength() const{return duplicateContentLength;}
+    /// True when the parsed message declared a Content-Length that is not
+    /// strictly valid per RFC 9112 (decimal digits only, representable in
+    /// size_t). For backward compatibility the parser still FRAMES the message
+    /// with the legacy numeric-prefix value atoi produced ("5, 5" frames as 5) -
+    /// only the crash class (negative or overflowing values, which previously
+    /// threw an uncaught length_error out of body.reserve()) stays
+    /// length-unknown. Callers that need strict framing certainty - the
+    /// connection-reuse gate, or a future 400-emitting server enforcement - must
+    /// check this flag and refuse; the parser does not emit protocol responses
+    /// itself.
+    bool hasFramingError() const{return framingError;}
+    /// True when ANY Connection header field of the parsed message carried a
+    /// "close" token (case-insensitive, any case combination of the name).
+    /// GetHeader cannot answer this: the case-sensitive map hides case-variant
+    /// duplicates behind exact-match-first lookup, and same-case duplicates
+    /// overwrite - either can bury a "close" the peer did send. Connection-reuse
+    /// logic must refuse when this is set.
+    bool hasConnectionClose() const{return connectionClose;}
     void auth(const std::string &user, const std::string &pass, const std::string &authReq,
               const std::string &headerName = "Authorization");
     std::string body;
@@ -79,6 +103,10 @@ namespace HTTP{
     bool parse(std::string & HTTPbuffer, std::function<void(const char *, size_t)> onData = 0);
     std::string builder;
     std::string read_buffer;
+    bool duplicateContentLength = false; ///< See hasDuplicateContentLength()
+    bool seenContentLengthHdr = false;   ///< Parse-time tracker for the above
+    bool framingError = false;           ///< See hasFramingError()
+    bool connectionClose = false;        ///< See hasConnectionClose()
     std::map<std::string, std::string> headers;
     std::map<std::string, std::string> vars;
     void Trim(std::string &s);

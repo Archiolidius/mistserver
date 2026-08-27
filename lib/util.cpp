@@ -289,39 +289,210 @@ namespace Util{
     }
   }
 
+  /// Parses MIST_PUT_DEADLINE_MS once (see openNextUpload for the format rules).
+  /// 0 = legacy blocking behavior.
+  static int64_t putDeadlineBudgetMS(){
+    static int64_t putBudgetMS = -1;
+    if (putBudgetMS < 0) {
+      putBudgetMS = 0;
+      const char *envBudget = getenv("MIST_PUT_DEADLINE_MS");
+      if (envBudget && *envBudget) {
+        char *endPtr = 0;
+        long long parsed = strtoll(envBudget, &endPtr, 10);
+        if (!*endPtr && parsed == 0) {
+          // Explicit "0" is the documented way to keep legacy behavior: stay silent.
+        } else if (*endPtr || parsed < 1000 || parsed > 600000) {
+          WARN_MSG("Ignoring MIST_PUT_DEADLINE_MS='%s' (needs a plain integer of 1000-600000 ms)", envBudget);
+        } else {
+          putBudgetMS = parsed;
+          INFO_MSG("PUT deadline mode active: %" PRId64 " ms budget per upload", putBudgetMS);
+        }
+      }
+    }
+    return putBudgetMS;
+  }
+
+  /// MIST_PUT_PERSISTENT: reuse one HTTPS connection per upload target instead of
+  /// reconnecting per request (YouTube HLS ingest requires "a persistent
+  /// connection for all requests"). Deliberately inert without MIST_PUT_DEADLINE_MS:
+  /// the legacy (no-deadline) startPut path returns false without retrying once a
+  /// request head is sent, so a stale reused socket would silently drop an upload.
+  /// With the deadline set, a stale socket is retried by the existing bounded loop
+  /// and the reconnect counts as a normal attempt.
+  static bool putPersistActive(){
+    static int8_t mode = -1;
+    if (mode < 0) {
+      mode = 0;
+      const char *envP = getenv("MIST_PUT_PERSISTENT");
+      if (envP && *envP) {
+        if (!strcmp(envP, "1") || !strcasecmp(envP, "true")) {
+          if (putDeadlineBudgetMS() > 0) {
+            mode = 1;
+            INFO_MSG("Persistent PUT connections active (per upload target)");
+          } else {
+            INFO_MSG("MIST_PUT_PERSISTENT is set but inert: it requires MIST_PUT_DEADLINE_MS");
+          }
+        } else if (strcmp(envP, "0") && strcasecmp(envP, "false")) {
+          WARN_MSG("Ignoring MIST_PUT_PERSISTENT='%s' (use 1/true to enable)", envP);
+        }
+      }
+    }
+    return mode == 1;
+  }
+
+  // The Downloader is created on first use, not in the constructor: uploaders
+  // are declared unconditionally in Output::run() for every output process, and
+  // only the persistent HTTP(S) push path ever calls downloader(). Eager
+  // construction would cost every RTMP/RTSP/WebSocket session an allocation and
+  // an http_proxy getenv/log for a feature it never touches.
+  PersistentUploader::PersistentUploader() : dl(0) {}
+  PersistentUploader::~PersistentUploader() { delete dl; }
+  HTTP::Downloader &PersistentUploader::downloader() {
+    if (!dl) { dl = new HTTP::Downloader(); }
+    return *dl;
+  }
+
+  /// \brief Finalizes the previous chunked upload on the given connection, if any.
+  /// Sends the final zero chunk, waits up to 5 s for the server's final response,
+  /// classifies it, and closes the connection. Timing and logging are identical to the
+  /// historical externalWriter behavior; the classification is returned instead of
+  /// being discarded.
+  PutFinalizeResult finalizePreviousUpload(Socket::Connection & conn, const std::string & uriHint, uint64_t deadlineMS, PersistentUploader *uploader) {
+    // A connection still in chunked mode had an upload in flight. If it is already dead,
+    // the peer killed that upload (a body write detected the drop) - report it as the
+    // transient failure it was, not as "nothing to finalize", so callers tracking
+    // delivery evidence are not told a lost segment succeeded.
+    if (!conn) { return conn.isChunkedMode() ? PUT_FIN_TRANSIENT : PUT_FIN_NONE; }
+    if (!conn.isChunkedMode()) { return PUT_FIN_NONE; }
+    uint64_t finalizeStart = Util::bootMS();
+    conn.SendNow(0, 0);
+    HTTP::Parser response;
+    bool gotResponse = false;
+    PutFinalizeResult result = PUT_FIN_NO_RESPONSE;
+    Event::Loop ev;
+    auto attemptFinish = [&]() {
+      if (response.Read(conn)) {
+        // An informational 1xx (e.g. "102 Processing") is not a verdict: the real final
+        // response is still coming. Accepting it as the outcome would classify a healthy
+        // upload as failed and, in recovery mode, count it against the failure clock.
+        if (response.url.size() && response.url[0] == '1') {
+          response.Clean();
+          return;
+        }
+        uint64_t finalizeMs = Util::bootMS() - finalizeStart;
+        // Record the final status of every completed upload (observability only; callers decide what to do)
+        if (response.url.size() && response.url[0] == '2') {
+          INFO_MSG("Server response to upload (before %s): %s %s (confirmed 2xx after %" PRIu64 " ms)",
+                   uriHint.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
+          result = PUT_FIN_OK_2XX;
+        } else {
+          // Same leading text as the 2xx line above on purpose: existing log-based
+          // health checks grep for this prefix, and the failures this patch exists to
+          // expose must not be the one case that stops matching. The severity and the
+          // trailing classification carry the difference.
+          WARN_MSG("Server response to upload (before %s): %s %s (NON-2XX after %" PRIu64 " ms)",
+                   uriHint.c_str(), response.url.c_str(), response.method.c_str(), finalizeMs);
+          // Only a genuine client-side rejection is permanent. 5xx, 408 (timeout) and
+          // 429 (rate limited) are retryable, and an informational 1xx is not a verdict
+          // at all - classifying any of those as permanent would tear down a push that
+          // the endpoint is willing to keep serving.
+          std::string code = response.url;
+          if (code.size() && code[0] == '4' && code != "408" && code != "429") {
+            result = PUT_FIN_PERMANENT;
+          } else {
+            result = PUT_FIN_TRANSIENT;
+          }
+        }
+        gotResponse = true;
+      }
+    };
+    conn.setBlocking(false);
+    ev.addSocket(conn.getSocket(), [&](void *) {
+      while (conn.spool()) { attemptFinish(); }
+    }, 0);
+    uint64_t maxWait = Util::bootMS() + 5000;
+    // A caller-provided deadline can only shorten the wait, never extend it.
+    if (deadlineMS && deadlineMS < maxWait) { maxWait = deadlineMS; }
+    attemptFinish();
+    while (!gotResponse && Util::bootMS() < maxWait) { ev.await(1000); }
+    // A close-delimited response (no Content-Length, no chunked encoding) is only
+    // reported complete once the peer closes, and the spool loop above stops on that
+    // same close - so try one last parse before calling it a non-reply.
+    if (!gotResponse) { attemptFinish(); }
+    if (!gotResponse) {
+      WARN_MSG("No reply from remote server to PUT request (%s, waited %" PRIu64 " ms)",
+               conn ? "connection still open" : "connection lost", (uint64_t)(Util::bootMS() - finalizeStart));
+      if (!conn) { result = PUT_FIN_TRANSIENT; }
+    }
+    // Connection-reuse eligibility (MIST_PUT_PERSISTENT). Every condition must
+    // hold; anything else falls through to the unconditional close below, so the
+    // worst case is exactly the legacy behavior. The rules, and why each exists:
+    //  - a confirmed 2xx on HTTP/1.1 without a "Connection: close" token;
+    //  - generation match: the connection must still be the one this uploader
+    //    last used - an address or fd can repeat after close()/open(), the
+    //    generation cannot, so a swap we never observed (Downloader-internal
+    //    reconnect, /dev/null segment fallback) disqualifies automatically;
+    //  - length-delimited framing only: the response parser returns at a chunked
+    //    response's zero-size chunk WITHOUT consuming the terminator or trailers,
+    //    and "no residual bytes visible" cannot prove otherwise (they may sit in
+    //    the kernel or arrive later), so ANY chunked final response closes. A
+    //    valid Content-Length is required in full-string digits - not atoi,
+    //    which accepts trailing garbage - with no Transfer-Encoding header and
+    //    no duplicate Content-Length (case-insensitive; the parser flags these,
+    //    since its case-sensitive header map cannot expose them afterwards);
+    //  - an empty receive buffer after the parse.
+    if (uploader) {
+      uploader->reusable = false;
+      if (putPersistActive() && gotResponse && result == PUT_FIN_OK_2XX && conn &&
+          conn.getGeneration() == uploader->lastGeneration &&
+          response.protocol == "HTTP/1.1" && !response.hasDuplicateContentLength() &&
+          !response.hasFramingError() && !conn.Received().size()) {
+        // Parse-time flag, not GetHeader: duplicate Connection fields (case
+        // variants, or a later same-name field overwriting an earlier one) can
+        // hide a "close" token from the map. The flag saw every field as parsed.
+        bool closeRequested = response.hasConnectionClose();
+        bool lengthDelimited = false;
+        // hasHeader, not the value: an empty "Transfer-Encoding:" header is still
+        // a Transfer-Encoding header and must disqualify (fail closed).
+        if (!response.hasHeader("Transfer-Encoding")) {
+          const std::string &cl = response.GetHeader("Content-Length");
+          if (cl == "0") {
+            // Maximally fail-closed: ONLY an explicit zero-length body qualifies,
+            // 204 included - the parser returns at a 204's header end before any
+            // body validation runs, so a malformed "204 + Content-Length: 5 +
+            // delayed body" would pass every other check here and desync the
+            // next response. A nonzero Content-Length is refused for the same
+            // reason. Refusing costs nothing: YouTube's ingest answers
+            // Content-Length: 0 (measured 2026-08-26). Trailing garbage ("0x")
+            // fails the exact string compare by construction.
+            lengthDelimited = true;
+          }
+        }
+        if (lengthDelimited && !closeRequested) {
+          uploader->reusable = true;
+          // Stays nonblocking: the deadline-mode request path (the only mode
+          // persistence runs in, see putPersistActive) expects exactly that.
+          return result;
+        }
+      }
+    }
+    conn.close();
+    return result;
+  }
+
   /// \brief Connects the given file descriptor to a file or uploader binary
   /// \param uri target URL or filepath
   /// \param outFile file descriptor which will be used to send data
   /// \param append whether to open this connection in truncate or append mode
-  bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append) {
-    // Send final chunk if in chunked mode
-    if (conn && conn.isChunkedMode()) {
-      conn.SendNow(0, 0);
-      HTTP::Parser response;
-      bool gotResponse = false;
-      Event::Loop ev;
-      auto attemptFinish = [&]() {
-        if (response.Read(conn)) {
-          INFO_MSG("Server response to upload (before %s): %s %s", uri.c_str(), response.url.c_str(), response.method.c_str());
-          // If the response is a 2XX code, return 0, otherwise return the default response (2).
-          if (response.url.size() && response.url[0] == '2') {
-            // Success
-          } else {
-            // Failure
-          }
-          gotResponse = true;
-        }
-      };
-      conn.setBlocking(false);
-      ev.addSocket(conn.getSocket(), [&](void *) {
-        while (conn.spool()) { attemptFinish(); }
-      }, 0);
-      uint64_t maxWait = Util::bootMS() + 5000;
-      attemptFinish();
-      while (!gotResponse && Util::bootMS() < maxWait) { ev.await(1000); }
-      if (!gotResponse) { WARN_MSG("No reply from remote server to PUT request"); }
-      conn.close();
-    }
+  bool externalWriter(const std::string & uri, Socket::Connection & conn, bool append, bool ytPushIdentity, PersistentUploader *uploader) {
+    // Send final chunk if in chunked mode (historical behavior: result ignored)
+    finalizePreviousUpload(conn, uri, 0, uploader);
+    return openNextUpload(uri, conn, append, 0, ytPushIdentity, uploader);
+  }
+
+  /// \brief The "open" half of externalWriter: connects the given connection to a file
+  /// or uploader binary without touching any previous upload state on it.
+  bool openNextUpload(const std::string & uri, Socket::Connection & conn, bool append, uint64_t deadlineMS, bool ytPushIdentity, PersistentUploader *uploader) {
     HTTP::URL target = HTTP::localURIResolver().link(uri);
 
     // Local paths just write to file
@@ -384,9 +555,61 @@ namespace Util{
     }
     if (target.protocol == "http" || target.protocol == "https") {
       HIGH_MSG("Using native HTTP PUT handler with protocol %s", target.protocol.c_str());
-      HTTP::Downloader dl;
+      HTTP::Downloader localDl;
+      bool persist = uploader && putPersistActive();
+      // The persisted Downloader is the reuse authority: its connectedHost/Port/
+      // TLS state lets prepareRequest keep a matching live socket. A fresh local
+      // Downloader (the non-persistent path) has empty state, so prepareRequest
+      // reconnects - exactly the legacy behavior.
+      HTTP::Downloader &dl = persist ? uploader->downloader() : localDl;
+      if (persist && conn &&
+          !(uploader->reusable && conn.getGeneration() == uploader->lastGeneration)) {
+        // Not eligible for reuse: force a fresh connection. Without this,
+        // prepareRequest would happily keep an open socket to the same host even
+        // though finalize refused to certify its message boundary.
+        conn.close();
+      }
       target = HTTP::injectHeaders(target, "PUT", dl);
-      if (!dl.startPut(target, conn)) { return false; }
+      // MIST_PUT_USER_AGENT: on YouTube HLS push uploads only (ytPushIdentity is set
+      // by exactly those call sites), identify LiveReacting in the User-Agent format
+      // YouTube's HLS ingest guide documents: "<manufacturer> / <model> / <version>".
+      // The switch picks between two fixed strings - env content never reaches the
+      // header. Off (the default) keeps today's identity everywhere.
+      static int8_t putUAMode = -1;
+      if (putUAMode < 0) {
+        putUAMode = 0;
+        const char *envUA = getenv("MIST_PUT_USER_AGENT");
+        if (envUA && *envUA) {
+          if (!strcmp(envUA, "1") || !strcasecmp(envUA, "true")) {
+            putUAMode = 1;
+            INFO_MSG("Push User-Agent override active: LiveReacting / MistServer / " PACKAGE_VERSION);
+          } else if (strcmp(envUA, "0") && strcasecmp(envUA, "false")) {
+            WARN_MSG("Ignoring MIST_PUT_USER_AGENT='%s' (use 1/true to enable)", envUA);
+          }
+        }
+      }
+      if (ytPushIdentity && putUAMode == 1) {
+        dl.setHeader("User-Agent", "LiveReacting / MistServer / " PACKAGE_VERSION);
+      }
+      // Optional overall deadline for the whole PUT operation (connect, TLS handshake,
+      // 100-continue wait, retries and backoff). MIST_PUT_DEADLINE_MS unset or 0 keeps
+      // the legacy blocking behavior byte-for-byte. Values outside 1000-600000 ms, or
+      // any value that is not a plain integer, are rejected with a warning and disable
+      // the mode: a typo like "1e5" would otherwise parse as a 1 ms budget and fail
+      // every single upload. (Parsing lives in putDeadlineBudgetMS so the
+      // persistence gate can require deadline mode.)
+      int64_t putBudgetMS = putDeadlineBudgetMS();
+      uint64_t putDeadline = putBudgetMS ? Util::bootMS() + putBudgetMS : 0;
+      // A caller-provided deadline can only tighten the budget, never extend it.
+      if (deadlineMS && (!putDeadline || deadlineMS < putDeadline)) { putDeadline = deadlineMS; }
+      if (!dl.startPut(target, conn, 6, putDeadline)) { return false; }
+      if (persist) {
+        // Record which connection this uploader just used. finalize certifies (or
+        // refuses) reuse against this exact generation next cycle; until then the
+        // connection is not reusable.
+        uploader->lastGeneration = conn.getGeneration();
+        uploader->reusable = false;
+      }
       return true;
     }
     ERROR_MSG("Could not connect to '%s', since we do not have a configured external writer to "
@@ -420,6 +643,27 @@ namespace Util{
       for (size_t i = cnt; i < len; ++i){((char*)dest)[i] = rand() % 255;}
     }
     rndSrc.close();
+  }
+
+  /// Lowercase hex string of `bytes` bytes read from /dev/urandom.
+  /// Unlike getRandomBytes there is deliberately NO rand() fallback: callers use
+  /// this for uniqueness guarantees (MIST_HLS_UNIQUE_SEGMENTS session tokens),
+  /// where a weak token would silently void the guarantee. Returns the empty
+  /// string when the secure source cannot supply all requested bytes - callers
+  /// must fail closed on that.
+  std::string secureRandomHex(size_t bytes){
+    std::string raw(bytes, '\0');
+    std::ifstream rndSrc("/dev/urandom", std::ifstream::binary);
+    rndSrc.read(&raw[0], bytes);
+    if (!rndSrc.good() || (size_t)rndSrc.gcount() != bytes){return "";}
+    rndSrc.close();
+    static const char hexDigits[] = "0123456789abcdef";
+    std::string ret(bytes * 2, '0');
+    for (size_t i = 0; i < bytes; ++i){
+      ret[i * 2] = hexDigits[(raw[i] >> 4) & 0xF];
+      ret[i * 2 + 1] = hexDigits[raw[i] & 0xF];
+    }
+    return ret;
   }
 
   /// Secure random alphanumeric string generator

@@ -34,6 +34,10 @@ void HTTP::Parser::Clean(){
 /// Completely re-initializes the HTTP::Parser, leaving it ready for either reading or writing
 /// usage.
 void HTTP::Parser::CleanPreserveHeaders(){
+  duplicateContentLength = false;
+  seenContentLengthHdr = false;
+  framingError = false;
+  connectionClose = false;
   seenHeaders = false;
   seenReq = false;
   possiblyComplete = false;
@@ -377,7 +381,7 @@ void HTTP::Parser::Proxy(Socket::Connection &from, Socket::Connection &to){
       }
     }
   }else{
-    unsigned int bodyLen = length;
+    size_t bodyLen = length; // was unsigned int: silently truncated valid >4GiB lengths
     while (bodyLen > 0 && to.connected() && from.connected()){
       if (from.Received().size() || from.spool()){
         if (from.Received().get().size() <= bodyLen){
@@ -612,10 +616,76 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           currentLength = 0;
           body.clear();
           knownLength = false;
-          if (GetHeader("Content-Length") != ""){
-            length = atoi(GetHeader("Content-Length").c_str());
-            if (!bodyCallback && !onData && body.capacity() < length) { body.reserve(length); }
-            knownLength = true;
+          if (hasHeader("Content-Length")){
+            // Two separate concerns, deliberately decoupled:
+            // 1) STRICT validation (RFC 9112: decimal digits only, representable
+            //    in size_t) feeds hasFramingError(). The connection-reuse gate -
+            //    and any future 400-emitting server enforcement - refuses on it.
+            //    hasHeader, not a value check: an EMPTY Content-Length header is
+            //    present-but-invalid and must flag.
+            // 2) MESSAGE FRAMING keeps the legacy numeric-prefix semantics that
+            //    atoi provided here for two decades ("5, 5" frames as 5, "0x" as
+            //    0), so every server and client in the codebase behaves
+            //    byte-identically to before for any input that did not crash.
+            //    The one legacy behavior NOT preserved is the crash class: atoi
+            //    overflow (or a negative value) sign-extended into a huge size_t
+            //    and body.reserve() threw an uncaught length_error - a remote
+            //    peer could kill any Mist HTTP client or server with one header.
+            //    That class has no behavior to preserve; it stays length-unknown.
+            const std::string &clVal = GetHeader("Content-Length");
+            uint64_t clParsed = 0;
+            bool clDigitsOnly = clVal.size() > 0;
+            for (size_t ci = 0; clDigitsOnly && ci < clVal.size(); ++ci){
+              if (clVal[ci] < '0' || clVal[ci] > '9'){clDigitsOnly = false; break;}
+              uint64_t digit = clVal[ci] - '0';
+              if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clDigitsOnly = false; break;}
+              clParsed = clParsed * 10 + digit;
+            }
+            bool clUsable = clDigitsOnly;
+            if (clDigitsOnly){
+              // Strictly valid value. Above INT_MAX the base atoi was a lottery
+              // of crash and misframe (int truncation: 3000000000 crashed,
+              // 4294967296 framed as 0) - correct framing is the fix, not a
+              // compatibility break. Unrepresentable on this platform (32-bit
+              // size_t) still flags: the value is valid but cannot be handled.
+              if (clParsed > (uint64_t)SIZE_MAX){
+                framingError = true;
+                clUsable = false;
+              }
+            }else{
+              framingError = true;
+              // Legacy-compatible framing fallback for RFC-invalid values: the
+              // leading numeric prefix, exactly as atoi read it (SetHeader
+              // already trimmed whitespace; "5, 5" frames as 5, "0x" as 0, "-0"
+              // as 0). Only the crash class - a negative NONZERO value or an
+              // overflowing prefix, which sign-extended/overflowed into a huge
+              // size_t and threw an uncaught length_error out of body.reserve()
+              // - stays length-unknown: it has no non-crash behavior to keep.
+              clParsed = 0;
+              clUsable = clVal.size() > 0; // empty stayed length-unknown before too
+              bool clNegative = false;
+              size_t ci = 0;
+              if (clUsable && (clVal[ci] == '+' || clVal[ci] == '-')){
+                clNegative = (clVal[ci] == '-');
+                ++ci;
+              }
+              for (; clUsable && ci < clVal.size() && clVal[ci] >= '0' && clVal[ci] <= '9'; ++ci){
+                uint64_t digit = clVal[ci] - '0';
+                if (clParsed > (0xFFFFFFFFFFFFFFFFull - digit) / 10){clUsable = false; break;}// crash class
+                clParsed = clParsed * 10 + digit;
+              }
+              if (clNegative && clParsed){clUsable = false;}// crash class; "-0" framed as 0 without one
+              if (clParsed > (uint64_t)SIZE_MAX){clUsable = false;}
+            }
+            if (clUsable){
+              length = clParsed;
+              // reserve() is an optimization only: cap it so a large (but valid)
+              // length cannot force a huge upfront allocation.
+              if (!bodyCallback && !onData && body.capacity() < length && length <= (16ull << 20)){
+                body.reserve(length);
+              }
+              knownLength = true;
+            }
           }
           if (GetHeader("Transfer-Encoding") == "chunked"){
             getChunks = true;
@@ -626,6 +696,32 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
           if (f == std::string::npos) continue;
           tmpB = tmpA.substr(0, f);
           tmpC = tmpA.substr(f + 1);
+          {
+            // Parse-time tracking for the two connection-reuse-critical headers.
+            // The header map is case-sensitive with overwrite-on-set, so after
+            // parsing it cannot show duplicates, case variants, or an earlier
+            // value a later same-name field replaced - only seeing each field
+            // AS PARSED can. Names are trimmed FIRST, exactly like SetHeader
+            // trims the map key: "Content-Length : 5" collapses into the same
+            // map entry as "Content-Length: 0", so an untrimmed comparison
+            // would let that pair through as a non-duplicate.
+            std::string lowered = tmpB;
+            Trim(lowered);
+            for (size_t li = 0; li < lowered.size(); ++li){lowered[li] = tolower(lowered[li]);}
+            if (lowered == "content-length"){
+              // See hasDuplicateContentLength().
+              if (seenContentLengthHdr){duplicateContentLength = true;}
+              seenContentLengthHdr = true;
+            }else if (lowered == "connection"){
+              // See hasConnectionClose(): a "close" token in ANY Connection
+              // field counts, even when another field (case-variant duplicate,
+              // or a later same-name overwrite) would hide it from GetHeader.
+              std::string val = tmpC;
+              Trim(val);
+              for (size_t li = 0; li < val.size(); ++li){val[li] = tolower(val[li]);}
+              if (val.find("close") != std::string::npos){connectionClose = true;}
+            }
+          }
           SetHeader(tmpB, tmpC);
         }
       }
@@ -638,7 +734,7 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer, std::function<void(const char
         if ((code >= 100 && code < 200) || code == 204 || code == 304){return true;}
       }
       if (knownLength && !getChunks){
-        unsigned int toappend = length - currentLength;
+        size_t toappend = length - currentLength;
 
         // limit the amount of bytes that will be appended to the amount there
         // is available

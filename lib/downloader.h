@@ -13,7 +13,8 @@ namespace HTTP{
     ~Downloader();
     std::string &data();
     const std::string &const_data() const;
-    void prepareRequest(const HTTP::URL & link, const std::string & method, Socket::Connection & conn);
+    void prepareRequest(const HTTP::URL & link, const std::string & method, Socket::Connection & conn,
+                        uint64_t deadlineMS = 0);
     bool get(const std::string &link, Util::DataCallback &cb = Util::defaultDataCallback);
     bool get(const HTTP::URL & link, const std::string & method = "GET", uint8_t maxRecursiveDepth = 6,
              Util::DataCallback & cb = Util::defaultDataCallback);
@@ -28,7 +29,13 @@ namespace HTTP{
     bool post(const HTTP::URL &link, const std::string &payload, bool sync = true,
               uint8_t maxRecursiveDepth = 6);
 
-    bool startPut(const HTTP::URL & link, Socket::Connection & conn, uint8_t maxRecursiveDepth = 6);
+    /// deadlineMS: optional absolute Util::bootMS() deadline bounding everything up to
+    /// and including the 100-continue reply: TCP connect, TLS handshake, the wait for
+    /// "100 Continue", retries and their backoff. It does NOT cover the body upload -
+    /// the socket goes back to blocking once the server has approved the request - and
+    /// DNS resolution is a documented overshoot. 0 = legacy blocking behavior.
+    bool startPut(const HTTP::URL & link, Socket::Connection & conn, uint8_t maxRecursiveDepth = 6,
+                  uint64_t deadlineMS = 0);
 
     bool getNonBlocking(const HTTP::URL &link, uint8_t maxRecursiveDepth = 6, const std::string & method = "GET");
     bool continueNonBlocking(std::function<size_t()> resumePos, std::function<void(const char *, size_t)> onData);

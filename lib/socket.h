@@ -148,6 +148,10 @@ namespace Socket{
     uint64_t up;
     uint64_t down;
     long long int conntime;
+    // Reconnect generation: bumped on every drop(), never reset. Gives reuse
+    // logic an exact-match identity that detects a close-and-reopen even when
+    // it happened inside a callee (a Downloader retry, a descriptor swap).
+    uint64_t generation = 0;
     Buffer downbuffer; ///< Stores received data (both in blocking and non-blocking modes)
     Buffer upBuffer; ///< In non-blocking mode, buffers outgoing writes
     int iread(void *buffer, int len, int flags = 0);  ///< Incremental read call.
@@ -185,11 +189,13 @@ namespace Socket{
     ~Connection();
     // generic methods
     void open(int sockNo); // Open from existing socket connection.
-    void open(std::string host, int port, bool nonblock, bool with_ssl = false, const std::string & hostname = ""); // Open TCP connection.
+    void open(std::string host, int port, bool nonblock, bool with_ssl = false, const std::string & hostname = "",
+              uint64_t deadlineMS = 0); // Open TCP connection. Optional absolute Util::bootMS() deadline (0 = legacy behavior).
     void open(std::string adres, bool nonblock = false); // Open Unix connection.
     void open(int write, int read);                      // Open from two existing file descriptors.
 #ifdef SSL
     bool sslAccept(mbedtls_ssl_config * sslConf, mbedtls_ctr_drbg_context * dbgCtx);
+    void sslPreConnectCleanup(); ///< Frees SSL contexts after a failed connect/handshake (drop() only cleans up once sslConnected is set).
 #endif
     void close();                                        ///< Close connection.
     void drop();                                         ///< Close connection without shutdown.
@@ -230,6 +236,7 @@ namespace Socket{
     uint64_t dataUp();       ///< Returns total amount of bytes sent.
     uint64_t dataDown();     ///< Returns total amount of bytes received.
     void resetCounter();     ///< Resets the up/down bytes counter to zero.
+    uint64_t getGeneration() const; ///< Reconnect generation; exact match = same live connection.
     void addUp(const uint32_t i);
     void addDown(const uint32_t i);
     friend class Server;
